@@ -1,0 +1,9 @@
+streamlit
+pandas
+folium
+streamlit-folium
+geopy
+pillow
+gspread
+google-auth
+requests

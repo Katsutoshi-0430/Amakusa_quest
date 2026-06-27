@@ -1,0 +1,11 @@
+streamlit
+pandas
+folium
+streamlit-folium
+geopy
+pillow
+gspread
+google-auth
+requests
+streamlit-geolocation
+streamlit-js-eval

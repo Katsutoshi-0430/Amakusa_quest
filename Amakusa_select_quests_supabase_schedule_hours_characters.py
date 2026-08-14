@@ -986,6 +986,49 @@ def award_character_for_quest(q: Dict) -> Dict:
 # データ永続化 (Save/Load) 機能
 # -----------------------------
 APP_STATE_QUEST_ID = "__app_state__"
+APP_SURVEY_QUEST_ID = "__survey__"
+
+AGE_OPTIONS = ["選択してください", "10代", "20代", "30代", "40代", "50代", "60代以上"]
+FEATURE_SURVEY_ITEMS = [
+    "全クエストモード",
+    "ストーリーモード",
+    "キャラクターコレクション",
+    "クエストマップ",
+    "旅のまとめ",
+    "足跡マップ・旅日記",
+    "ログインボーナス",
+]
+FEATURE_RATING_OPTIONS = [
+    "使っていない",
+    "1：とても不満",
+    "2：やや不満",
+    "3：どちらともいえない",
+    "4：満足",
+    "5：とても満足",
+]
+
+# 公式サイト・観光協会等で確認できた連絡先。電話ボタン表示用。
+QUEST_PHONE_NUMBERS: Dict[str, str] = {
+    "spot_fukuzumi": "0969-56-0299",
+    "spot_hamankura": "0964-59-0777",
+    "spot_ikoi": "0969-35-1014",
+    "spot_lisola": "0969-56-3450",
+    "play_seadonut": "0969-56-1155",
+    "food_aosa": "0969-73-3758",
+    "food_kura": "0969-52-7707",
+    "craft_unshu": "080-5254-7915",
+    "spot_dolphin": "0969-33-1600",
+    "story_1_shiro": "0964-56-5311",
+    "story_3_ueno": "0969-56-1255",
+    "story_4_kirishitan": "0969-22-3845",
+}
+
+def quest_phone(q: Dict) -> str:
+    return QUEST_PHONE_NUMBERS.get(q.get("quest_id", ""), "")
+
+def tel_url(phone: str) -> str:
+    digits = re.sub(r"[^0-9+]", "", phone or "")
+    return f"tel:{digits}" if digits else ""
 
 
 def _safe_secret(name: str, default: str = "") -> str:
@@ -1112,6 +1155,11 @@ def _local_state_dict(include_photo_binary: bool = True) -> Dict:
         "story_progress": st.session_state.story_progress,
         "photos": st.session_state.photos,
         "photo_mime": st.session_state.photo_mime,
+        "profile_age": st.session_state.get("profile_age", ""),
+        "guide_seen": bool(st.session_state.get("guide_seen", False)),
+        "survey_answers": st.session_state.get("survey_answers", {}),
+        "survey_submitted": bool(st.session_state.get("survey_submitted", False)),
+        "survey_submitted_at": st.session_state.get("survey_submitted_at"),
     }
     # Supabaseにはプライバシーと容量の観点から画像本体は保存しない。
     # ローカル検証時だけ画像バイナリをJSONに含める。
@@ -1142,6 +1190,11 @@ def _apply_state_dict(data: Dict, include_photo_binary: bool = True) -> None:
     st.session_state.story_progress = data.get("story_progress", 0)
     st.session_state.photos = data.get("photos", {})
     st.session_state.photo_mime = data.get("photo_mime", {})
+    st.session_state.profile_age = data.get("profile_age", "")
+    st.session_state.guide_seen = bool(data.get("guide_seen", False))
+    st.session_state.survey_answers = data.get("survey_answers", {}) or {}
+    st.session_state.survey_submitted = bool(data.get("survey_submitted", False))
+    st.session_state.survey_submitted_at = data.get("survey_submitted_at")
 
     if include_photo_binary:
         photo_data = {}
@@ -1199,6 +1252,22 @@ def save_user_data_supabase():
         "completed": False,
         "favorite": False,
         "note": json.dumps(app_state, ensure_ascii=False),
+        "photo_uploaded": False,
+        "apples": int(st.session_state.get("apples", 0)),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="participant_id,quest_id").execute()
+
+    # アンケートは専用行にJSON保存。SupabaseのCSV出力時に参加者ごとに抽出しやすくする。
+    survey_payload = dict(st.session_state.get("survey_answers", {}) or {})
+    if st.session_state.get("profile_age"):
+        survey_payload["age"] = st.session_state.get("profile_age")
+    supabase.table("quest_progress").upsert({
+        "participant_id": pid,
+        "quest_id": APP_SURVEY_QUEST_ID,
+        "completed": bool(st.session_state.get("survey_submitted", False)),
+        "completed_at": st.session_state.get("survey_submitted_at"),
+        "favorite": False,
+        "note": json.dumps(survey_payload, ensure_ascii=False),
         "photo_uploaded": False,
         "apples": int(st.session_state.get("apples", 0)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1294,10 +1363,22 @@ def load_user_data_supabase(pid: str):
         except Exception:
             pass
 
+    # アンケート専用行があれば復元する。
+    survey_row = next((r for r in rows if r.get("quest_id") == APP_SURVEY_QUEST_ID), None)
+    if survey_row:
+        try:
+            st.session_state.survey_answers = json.loads(survey_row.get("note") or "{}")
+        except Exception:
+            st.session_state.survey_answers = {}
+        st.session_state.survey_submitted = bool(survey_row.get("completed"))
+        st.session_state.survey_submitted_at = survey_row.get("completed_at")
+        if not st.session_state.get("profile_age"):
+            st.session_state.profile_age = st.session_state.survey_answers.get("age", "")
+
     # クエストごとの状態を上書き・補完する。
     for row in rows:
         qid = row.get("quest_id")
-        if not qid or qid == APP_STATE_QUEST_ID:
+        if not qid or qid in {APP_STATE_QUEST_ID, APP_SURVEY_QUEST_ID}:
             continue
 
         if row.get("completed"):
@@ -1359,6 +1440,11 @@ def init_state() -> None:
         "clear_effect": None,
         "clear_effect_counter": 0,
         "clear_effect_shown_id": None,
+        "profile_age": "",
+        "guide_seen": False,
+        "survey_answers": {},
+        "survey_submitted": False,
+        "survey_submitted_at": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1421,14 +1507,35 @@ def render_character_card(char: Dict, locked: bool = False, compact: bool = Fals
                 st.caption(f"次の進化まで： {fed} / {target} 個")
                 st.progress(min(fed / max_apples, 1.0))
                 
-                apples_owned = st.session_state.apples
-                if st.button(f"🍎 リンゴをあげる", key=f"feed_{char.get('character_id')}", disabled=apples_owned <= 0, use_container_width=True):
-                    st.session_state.apples -= 1
-                    st.session_state.character_apples[char.get("character_id")] = fed + 1
-                    if (fed + 1) in {10, 20}:
+                apples_owned = int(st.session_state.apples)
+                cid = char.get("character_id")
+                next_need = max(0, target - fed)
+                feed_cols = st.columns(2)
+
+                if feed_cols[0].button("🍎 1個あげる", key=f"feed_one_{cid}", disabled=apples_owned <= 0, use_container_width=True):
+                    give = min(1, apples_owned, max_apples - fed)
+                    old_fed = fed
+                    new_fed = fed + give
+                    st.session_state.apples -= give
+                    st.session_state.character_apples[cid] = new_fed
+                    if (old_fed < 10 <= new_fed) or (old_fed < 20 <= new_fed):
                         st.balloons()
-                    save_user_data() # ★ 自動保存
+                    save_user_data()
                     st.rerun()
+
+                bulk_label = f"🍎 進化まで一気に（{next_need}個）"
+                if feed_cols[1].button(bulk_label, key=f"feed_bulk_{cid}", disabled=apples_owned < next_need or next_need <= 0, use_container_width=True):
+                    old_fed = fed
+                    new_fed = min(max_apples, fed + next_need)
+                    st.session_state.apples -= (new_fed - old_fed)
+                    st.session_state.character_apples[cid] = new_fed
+                    if (old_fed < 10 <= new_fed) or (old_fed < 20 <= new_fed):
+                        st.balloons()
+                    save_user_data()
+                    st.rerun()
+
+                if apples_owned < next_need:
+                    st.caption(f"進化まであと{next_need}個必要です（所持：{apples_owned}個）")
 
 
 def render_character_collection() -> None:
@@ -2391,6 +2498,9 @@ def quest_card(q: Dict, show_actions: bool = True, ui_scope: str = "quest") -> N
         render_place_photo(q, compact=not show_actions)
         st.write(q.get("description",""))
         st.markdown(f"**紐づく実在施設・イベント：** {q.get('linked_name','')}")
+        phone = quest_phone(q)
+        if phone:
+            st.markdown(f"**電話番号：** [{phone}]({tel_url(phone)})")
         if q.get("period"): st.markdown(f"**開催・利用時期：** {q['period']}")
         render_schedule_notice(q)
         st.markdown(f"**達成条件：** {q.get('condition','')}")
@@ -2436,7 +2546,9 @@ def quest_card(q: Dict, show_actions: bool = True, ui_scope: str = "quest") -> N
         cols = st.columns(3)
         cols[0].link_button("公式ページ", q.get("official_url",""), use_container_width=True)
         cols[1].link_button("Googleマップ", google_maps_search_url(q.get("linked_name",""), q.get("area","")), use_container_width=True)
-        if cols[2].button("お気に入り" if not favorite else "解除する", key=f"{ui_scope}_fav_{q['quest_id']}", use_container_width=True):
+        fav_col = cols[2]
+
+        if fav_col.button("お気に入り" if not favorite else "解除する", key=f"{ui_scope}_fav_{q['quest_id']}", use_container_width=True):
             if favorite: st.session_state.favorites.remove(q["quest_id"])
             else: st.session_state.favorites.add(q["quest_id"])
             save_user_data() # ★ 自動保存
@@ -2470,6 +2582,157 @@ def quest_card(q: Dict, show_actions: bool = True, ui_scope: str = "quest") -> N
                     st.toast("📝 メモとSNS投稿文を保存しました！")
 
 
+def _option_index(options: List[str], value: str, default: int = 0) -> int:
+    try:
+        return options.index(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def render_profile_setup() -> None:
+    """実証実験で最低限必要な年代を、利用開始時に1回だけ取得する。"""
+    if st.session_state.get("profile_age"):
+        return
+
+    st.info("🧪 テストマーケティングの集計のため、最初に年代だけ教えてください。個人を特定する情報は入力しません。")
+    with st.form("profile_age_form"):
+        age = st.selectbox("年代", AGE_OPTIONS, index=0)
+        submitted = st.form_submit_button("年代を登録してアプリを始める", type="primary", use_container_width=True)
+    if submitted:
+        if age == "選択してください":
+            st.warning("年代を選択してください。")
+        else:
+            st.session_state.profile_age = age
+            answers = dict(st.session_state.get("survey_answers", {}) or {})
+            answers["age"] = age
+            st.session_state.survey_answers = answers
+            save_user_data()
+            st.rerun()
+    st.stop()
+
+
+def render_usage_guide() -> None:
+    expanded = not bool(st.session_state.get("guide_seen", False))
+    with st.expander("📘 はじめての方へ｜アプリの使い方", expanded=expanded):
+        st.markdown("""
+**① クエストを選ぶ**  
+「おすすめ」または「全クエストモード」から、行ってみたい場所を選びます。マップから探すこともできます。
+
+**② 現地でクエストに挑戦**  
+対象スポットへ行き、GPS判定と写真添付を行うとクリアできます。
+
+**③ キャラクターとリンゴを獲得**  
+クエストをクリアするとキャラクターとリンゴを獲得。図鑑では「進化まで一気に」でまとめてリンゴをあげられます。
+
+**④ ストーリーモードにも挑戦**  
+天草四郎ゆかりの地を順番に巡るモードです。前の章をクリアすると次の章が解放されます。
+
+**⑤ 旅の記録を残す**  
+足跡マップ・旅日記や旅のまとめで、訪れた場所や感想を振り返れます。
+
+**⑥ 最後にアンケートへ回答**  
+「アンケート」タブから、使った機能や再訪意欲について回答してください。
+        """)
+        if not st.session_state.get("guide_seen", False):
+            if st.button("✅ 使い方を確認しました", use_container_width=True):
+                st.session_state.guide_seen = True
+                save_user_data()
+                st.rerun()
+
+
+def render_survey() -> None:
+    st.subheader("📝 テストマーケティング アンケート")
+    st.write("ご協力ありがとうございます。回答はアプリ改善と、天草への再訪につながるかの検証に使用します。")
+    if st.session_state.get("survey_submitted"):
+        st.success("✅ アンケートは回答済みです。内容を変更して再送信することもできます。")
+
+    ans = dict(st.session_state.get("survey_answers", {}) or {})
+    age_value = st.session_state.get("profile_age") or ans.get("age", "")
+    gender_options = ["選択してください", "男性", "女性", "回答しない・その他"]
+    region_options = ["選択してください", "天草", "熊本県内（天草外）", "九州地方（熊本県外）", "関東地方", "関西地方", "その他"]
+    companion_options = ["一人旅", "家族（配偶者・パートナー）", "家族（子ども連れ）", "家族（親・その他親族）", "友人・知人", "恋人", "旅行ではない（天草在住・日常利用）", "その他"]
+    game_options = ["選択してください", "よくする", "たまにする", "あまりしない", "全くしない"]
+    visit_options = ["選択してください", "初めて", "2回目", "3〜5回目", "6回目以上（リピーター）", "天草在住"]
+    change_options = ["選択してください", "1：大きく下がった", "2：やや下がった", "3：変わらない", "4：やや高まった", "5：大きく高まった", "該当しない（天草在住）"]
+    intent_options = ["選択してください", "1：全くそう思わない", "2：あまりそう思わない", "3：どちらともいえない", "4：そう思う", "5：とてもそう思う", "該当しない（天草在住）"]
+    satisfaction_options = ["選択してください", "1：とても不満", "2：やや不満", "3：どちらともいえない", "4：満足", "5：とても満足"]
+
+    with st.form("test_marketing_survey"):
+        st.markdown("### ■ あなた自身について（基本属性）")
+        age = st.selectbox("Q1. 年代を教えてください。", AGE_OPTIONS[1:], index=max(0, _option_index(AGE_OPTIONS[1:], age_value, 0)))
+        gender = st.selectbox("Q2. 性別を教えてください。", gender_options, index=_option_index(gender_options, ans.get("gender", "")))
+        region = st.selectbox("Q3. お住まいの地域を教えてください。", region_options, index=_option_index(region_options, ans.get("region", "")))
+        region_other = st.text_input("Q3-2. 「その他」の場合、地域を入力してください。", value=ans.get("region_other", ""))
+        companions = st.multiselect("Q4. 今回の旅の同行者を教えてください。（複数選択可）", companion_options, default=ans.get("companions", []))
+        companion_other = st.text_input("Q4-2. 「その他」の場合、同行者を入力してください。", value=ans.get("companion_other", ""))
+        gaming = st.selectbox("Q5. 普段、ゲーム（スマホアプリ、据え置き機など）はしますか？", game_options, index=_option_index(game_options, ans.get("gaming", "")))
+        visits = st.selectbox("Q6. 天草への訪問は今回で何回目ですか？", visit_options, index=_option_index(visit_options, ans.get("visits", "")))
+
+        st.markdown("### ■ アプリの機能について")
+        st.caption("各機能について、実際に使ったうえでの満足度を教えてください。使っていない機能は「使っていない」を選択してください。")
+        feature_answers = {}
+        saved_features = ans.get("feature_ratings", {}) or {}
+        for i, feature in enumerate(FEATURE_SURVEY_ITEMS, start=7):
+            feature_answers[feature] = st.radio(f"Q{i}. {feature}", FEATURE_RATING_OPTIONS, index=_option_index(FEATURE_RATING_OPTIONS, saved_features.get(feature, "使っていない")), horizontal=True, key=f"survey_feature_{feature}")
+
+        qn = 7 + len(FEATURE_SURVEY_ITEMS)
+        st.markdown("### ■ アプリを通しての再訪意欲")
+        revisit_change = st.selectbox(f"Q{qn}. このアプリを使ったことで、天草に『また来たい』という気持ちは高まりましたか？", change_options, index=_option_index(change_options, ans.get("revisit_change", "")))
+        revisit_intent = st.selectbox(f"Q{qn+1}. 今後1年以内に、天草を再び訪れたいと思いますか？", intent_options, index=_option_index(intent_options, ans.get("revisit_intent", "")))
+        reuse_intent = st.selectbox(f"Q{qn+2}. 次回天草を訪れる際にも、このアプリを使いたいと思いますか？", intent_options, index=_option_index(intent_options, ans.get("reuse_intent", "")))
+
+        st.markdown("### ■ アプリ全体について")
+        satisfaction = st.selectbox(f"Q{qn+3}. アプリ全体の満足度を教えてください。", satisfaction_options, index=_option_index(satisfaction_options, ans.get("overall_satisfaction", "")))
+        good_points = st.text_area(f"Q{qn+4}. 良かった点を教えてください。", value=ans.get("good_points", ""), height=100)
+        improvement_points = st.text_area(f"Q{qn+5}. 改善してほしい点を教えてください。", value=ans.get("improvement_points", ""), height=100)
+        requested_features = st.text_area(f"Q{qn+6}. 追加してほしい機能があれば教えてください。", value=ans.get("requested_features", ""), height=100)
+        submitted = st.form_submit_button("📨 アンケートを送信する", type="primary", use_container_width=True)
+
+    if submitted:
+        required_missing = []
+        if gender == "選択してください": required_missing.append("性別")
+        if region == "選択してください": required_missing.append("居住地域")
+        if not companions: required_missing.append("同行者")
+        if "一人旅" in companions and len(companions) > 1: required_missing.append("同行者（一人旅と他の選択肢は同時に選べません）")
+        if gaming == "選択してください": required_missing.append("ゲーム頻度")
+        if visits == "選択してください": required_missing.append("天草訪問回数")
+        if revisit_change == "選択してください": required_missing.append("再訪意欲の変化")
+        if revisit_intent == "選択してください": required_missing.append("1年以内の再訪意向")
+        if reuse_intent == "選択してください": required_missing.append("アプリ再利用意向")
+        if satisfaction == "選択してください": required_missing.append("全体満足度")
+        if region == "その他" and not region_other.strip(): required_missing.append("その他の居住地域")
+        if "その他" in companions and not companion_other.strip(): required_missing.append("その他の同行者")
+
+        if required_missing:
+            st.error("未回答の必須項目があります：" + "、".join(required_missing))
+        else:
+            payload = {
+                "age": age,
+                "gender": gender,
+                "region": region,
+                "region_other": region_other.strip(),
+                "companions": companions,
+                "companion_other": companion_other.strip(),
+                "gaming": gaming,
+                "visits": visits,
+                "feature_ratings": feature_answers,
+                "revisit_change": revisit_change,
+                "revisit_intent": revisit_intent,
+                "reuse_intent": reuse_intent,
+                "overall_satisfaction": satisfaction,
+                "good_points": good_points.strip(),
+                "improvement_points": improvement_points.strip(),
+                "requested_features": requested_features.strip(),
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+            st.session_state.profile_age = age
+            st.session_state.survey_answers = payload
+            st.session_state.survey_submitted = True
+            st.session_state.survey_submitted_at = payload["submitted_at"]
+            save_user_data()
+            st.success("ご回答ありがとうございました！アンケートを保存しました。")
+
+
 # =====================================================================
 # ★ UI構築
 # =====================================================================
@@ -2485,6 +2748,8 @@ if not st.session_state.get("data_loaded", False):
     st.session_state.data_loaded = True
     st.session_state.loaded_participant_id = st.session_state.get("participant_id")
 
+render_profile_setup()
+render_usage_guide()
 render_clear_reward_effect()
 
 col_log, col_prog = st.columns([1, 1])
@@ -2545,8 +2810,8 @@ if global_focus_qid:
             quest_card(display_quest_for_list(global_focus_q), show_actions=True, ui_scope=f"global_focus_{global_focus_qid}")
         st.divider()
 
-main_tab, list_tab, story_tab, map_tab, character_tab, fav_tab, summary_tab, db_tab = st.tabs([
-    "🌟 おすすめクエスト", "🔍 全クエスト一覧", "📜 ストーリー", "👣 足跡マップ・日記", "🎁 キャラクター図鑑 & 育成", "⭐ お気に入り", "🎒 旅のまとめ", "⚙️ データ確認"
+main_tab, list_tab, story_tab, map_tab, character_tab, fav_tab, summary_tab, survey_tab, db_tab = st.tabs([
+    "🌟 おすすめクエスト", "🔍 全クエストモード", "📜 ストーリー", "👣 足跡マップ・日記", "🎁 キャラクター図鑑 & 育成", "⭐ お気に入り", "🎒 旅のまとめ", "📝 アンケート", "⚙️ データ確認"
 ])
 
 with main_tab:
@@ -2560,7 +2825,7 @@ with main_tab:
             quest_card(q, show_actions=True, ui_scope=f"main_{i}_{q['quest_id']}")
 
 with list_tab:
-    st.subheader("🔍 全クエスト一覧")
+    st.subheader("🔍 全クエストモード")
     st.write("目的やエリアで絞り込んで、好きなクエストを探せます。ストーリーモードの未解放章は、場所名をシークレットとして表示します。")
     focused_qid = _get_query_param("focus_qid")
     
@@ -2618,6 +2883,9 @@ with story_tab:
                 continue
             
             st.markdown(f"**目的地：** {sq.get('linked_name','')} （{sq.get('area','')}）")
+            story_phone = quest_phone(sq)
+            if story_phone:
+                st.markdown(f"**電話番号：** [{story_phone}]({tel_url(story_phone)})")
             render_place_photo(sq, compact=True)
             render_schedule_notice(sq)
             st.write(sq.get('description',''))
@@ -2681,6 +2949,9 @@ with summary_tab:
         c1.metric("参加クエスト", len(done))
         c2.metric("仲間キャラ", len(st.session_state.unlocked_character_ids))
         c3.metric("所持リンゴ", st.session_state.apples)
+
+with survey_tab:
+    render_survey()
 
 with db_tab:
     st.subheader("⚙️ データ確認・表紙写真の登録")

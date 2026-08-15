@@ -1032,31 +1032,78 @@ def tel_url(phone: str) -> str:
 
 
 def _safe_secret(name: str, default: str = "") -> str:
-    """Streamlit Secretsの値を安全に取り出す。未設定でもアプリを落とさない。"""
+    """Streamlit Secretsの値を安全に取得する。"""
     try:
         return str(st.secrets.get(name, default)).strip()
     except Exception:
         return default
 
 
+def _supabase_connection_values() -> Tuple[str, str]:
+    """
+    SupabaseのURLとキーを取得する。
+
+    新形式:
+      SUPABASE_URL
+      SUPABASE_SERVICE_ROLE_KEY
+      SUPABASE_SECRET_KEY
+
+    旧形式:
+      [supabase]
+      url
+      service_role_key
+
+    の両方に対応する。
+    """
+    url = _safe_secret("SUPABASE_URL")
+    key = (
+        _safe_secret("SUPABASE_SERVICE_ROLE_KEY")
+        or _safe_secret("SUPABASE_SECRET_KEY")
+    )
+
+    if not url or not key:
+        try:
+            supabase_secrets = st.secrets.get("supabase", {})
+
+            if not url:
+                url = str(
+                    supabase_secrets.get("url", "")
+                ).strip()
+
+            if not key:
+                key = str(
+                    supabase_secrets.get("service_role_key", "")
+                    or supabase_secrets.get("secret_key", "")
+                    or supabase_secrets.get("key", "")
+                ).strip()
+        except Exception:
+            pass
+
+    return url, key
+
+
 def supabase_is_configured() -> bool:
-    """Supabase接続に必要な情報がそろっているか確認する。"""
+    """Supabase接続に必要な設定がそろっているか確認する。"""
+    url, key = _supabase_connection_values()
+
     return (
         create_client is not None
-        and bool(_safe_secret("SUPABASE_URL"))
-        and bool(_safe_secret("SUPABASE_SERVICE_ROLE_KEY") or _safe_secret("SUPABASE_SECRET_KEY"))
+        and bool(url)
+        and bool(key)
     )
 
 
 @st.cache_resource
 def get_supabase_client() -> Optional["Client"]:
-    """Supabaseクライアントを作成する。Secrets未設定時はNoneを返す。"""
+    """Supabaseクライアントを作成する。"""
     if create_client is None:
         return None
-    url = _safe_secret("SUPABASE_URL")
-    key = _safe_secret("SUPABASE_SERVICE_ROLE_KEY") or _safe_secret("SUPABASE_SECRET_KEY")
+
+    url, key = _supabase_connection_values()
+
     if not url or not key:
         return None
+
     return create_client(url, key)
 
 

@@ -1061,7 +1061,7 @@ def get_supabase_client() -> Optional["Client"]:
 
 
 def _get_query_param(name: str) -> str:
-    """URLの ?pid=... から参加者IDを取得する。"""
+    """URLのクエリパラメータを取得する。"""
     try:
         value = st.query_params.get(name, "")
         if isinstance(value, list):
@@ -1073,25 +1073,26 @@ def _get_query_param(name: str) -> str:
 
 def render_participant_setup() -> None:
     """
-    実証実験用の参加者IDをセットする。
-    URL例：https://xxxx.streamlit.app/?pid=AMK-7F3Q
+    利用者が覚えやすいニックネームを入力する。
+    DB互換のため、内部保存キーは従来どおり participant_id を使用する。
     """
     query_pid = _get_query_param("pid")
     if query_pid and not st.session_state.get("participant_id"):
         st.session_state.participant_id = query_pid
 
-    with st.expander("🧪 実証実験の参加者ID", expanded=not bool(st.session_state.get("participant_id"))):
-        st.caption("配布された参加者IDを入力してください。同じIDで開くと、タブを閉じた後もSupabaseから進捗を復元できます。")
+    with st.expander("👤 ニックネーム", expanded=not bool(st.session_state.get("participant_id"))):
+        st.caption("進捗を保存するため、ほかの参加者と重ならないニックネームを入力してください。同じニックネームで開くと続きから遊べます。")
         pid = st.text_input(
-            "参加者ID",
+            "ニックネーム",
             value=st.session_state.get("participant_id", ""),
-            placeholder="例：AMK-7F3Q",
+            placeholder="例：mei0720",
             key="participant_id_input",
+            max_chars=30,
         ).strip()
 
-        if st.button("この参加者IDで開始する", use_container_width=True):
+        if st.button("このニックネームで始める", type="primary", use_container_width=True):
             if not pid:
-                st.warning("参加者IDを入力してください。")
+                st.warning("ニックネームを入力してください。")
             else:
                 old_pid = st.session_state.get("participant_id")
                 st.session_state.participant_id = pid
@@ -1101,20 +1102,20 @@ def render_participant_setup() -> None:
                 st.rerun()
 
         if st.session_state.get("participant_id"):
-            st.success(f"現在の参加者ID：{st.session_state.participant_id}")
+            st.success(f"👋 {st.session_state.participant_id} さん")
             if supabase_is_configured():
-                st.caption("保存先：Supabase")
+                st.caption("進捗は自動保存されます")
             else:
                 st.warning("Supabase Secretsが未設定です。今はローカル保存になります。実証実験前に必ず設定してください。")
         else:
-            st.info("参加者IDが未設定です。実証実験では必ず参加者IDを入力してから始めてください。")
+            st.info("ニックネームを入力するとアプリを始められます。")
 
     if not st.session_state.get("participant_id"):
         st.stop()
 
     ensure_participant(st.session_state.participant_id)
 
-    # 参加者IDが変わった場合は、その人のデータを再ロードする。
+    # ニックネームが変わった場合は、その利用者のデータを再ロードする。
     if st.session_state.get("loaded_participant_id") != st.session_state.participant_id:
         st.session_state.data_loaded = False
 
@@ -1445,6 +1446,7 @@ def init_state() -> None:
         "survey_answers": {},
         "survey_submitted": False,
         "survey_submitted_at": None,
+        "map_selected_qid": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2214,7 +2216,7 @@ def render_photo_clear_panel(q: Dict, ui_scope: str = "quest") -> bool:
         return False
 
     st.markdown("#### 📸 写真によるクリア確認")
-    st.caption("クリア条件：GPS判定OKに加えて、現地で撮った写真、または写真フォルダから選んだ写真の添付が必要です。")
+    st.caption("クリア条件：GPS判定・写真")
 
     if has_clear_photo(q):
         st.success("写真確認OK：クリア用写真が添付されています。")
@@ -2378,14 +2380,14 @@ def quest_map_popup_html(q: Dict, include_distance: bool = True) -> str:
     """
 
 
-def render_quest_map(quests_to_show: Optional[List[Dict]] = None, map_title: str = "🗺️ クエストマップ") -> None:
+def render_quest_map(quests_to_show: Optional[List[Dict]] = None, map_title: str = "🗺️ クエストマップ") -> Optional[str]:
     if map_title:
         st.subheader(map_title)
-    st.caption("ピンを押すとクエスト内容を確認できます。ポップアップ内の『このクエストを見る』から該当クエスト表示へ移動できます。")
+    st.caption("地図のピンをタップすると、選んだクエストがすぐ下に表示されます。")
 
     if folium is None or st_folium is None:
         st.error("地図を表示するには folium と streamlit-folium が必要です。requirements.txt に追加してください。")
-        return
+        return None
 
     all_quests = list(quests_to_show) if quests_to_show is not None else list(QUESTS) + list(STORY_QUESTS)
     quests_with_coords = [q for q in all_quests if get_coord(q)]
@@ -2462,7 +2464,34 @@ def render_quest_map(quests_to_show: Optional[List[Dict]] = None, map_title: str
         except Exception:
             pass
 
-    st_folium(m, width=1000, height=520)
+    map_state = st_folium(
+        m,
+        width=None,
+        height=480,
+        use_container_width=True,
+        returned_objects=["last_object_clicked"],
+        key=f"quest_map_{abs(hash(tuple(q.get('quest_id','') for q in all_quests)))}",
+    )
+
+    selected_qid = st.session_state.get("map_selected_qid", "")
+    clicked = (map_state or {}).get("last_object_clicked") or {}
+    if clicked and clicked.get("lat") is not None and clicked.get("lng") is not None:
+        click_lat = float(clicked["lat"])
+        click_lng = float(clicked["lng"])
+        # マーカー座標とクリック座標を照合。約20m以内ならそのクエストを選択。
+        closest_qid = ""
+        closest_d = float("inf")
+        for candidate in quests_with_coords:
+            candidate_coord = get_coord(candidate)
+            if not candidate_coord:
+                continue
+            d = haversine_m(click_lat, click_lng, candidate_coord[0], candidate_coord[1])
+            if d < closest_d:
+                closest_d = d
+                closest_qid = candidate.get("quest_id", "")
+        if closest_qid and closest_d <= 25:
+            selected_qid = closest_qid
+            st.session_state.map_selected_qid = closest_qid
 
     if quests_without_coords:
         with st.expander("座標未登録のクエストを確認する", expanded=False):
@@ -2473,6 +2502,8 @@ def render_quest_map(quests_to_show: Optional[List[Dict]] = None, map_title: str
                 "施設・イベント": display_quest_for_list(q).get("linked_name", ""),
                 "エリア": classified_area(q),
             } for q in quests_without_coords]), use_container_width=True)
+
+    return selected_qid
 
 
 def render_locked_story_card(q: Dict, ui_scope: str = "story_locked") -> None:
@@ -2490,10 +2521,9 @@ def render_locked_story_card(q: Dict, ui_scope: str = "story_locked") -> None:
 def quest_card(q: Dict, show_actions: bool = True, ui_scope: str = "quest") -> None:
     if not q.get("quest_id"): return
     completed = q["quest_id"] in st.session_state.completed
-    favorite = q["quest_id"] in st.session_state.favorites
 
     with st.container(border=True):
-        st.markdown(f"### {'★' if favorite else '☆'} {q.get('quest_name','')}")
+        st.markdown(f"### 📍 {q.get('quest_name','')}")
         st.caption(f"{'✅ 参加済み' if completed else '未参加'} / {q.get('quest_type','')} / {q.get('area','')} / {q.get('season','')} / {q.get('connection_level','')}")
         render_place_photo(q, compact=not show_actions)
         st.write(q.get("description",""))
@@ -2543,16 +2573,10 @@ def quest_card(q: Dict, show_actions: bool = True, ui_scope: str = "quest") -> N
             else:
                 st.info("このクエストをクリアすると、このキャラクターを獲得できます。図鑑では獲得するまでシークレット表示になります。")
 
-        cols = st.columns(3)
-        cols[0].link_button("公式ページ", q.get("official_url",""), use_container_width=True)
-        cols[1].link_button("Googleマップ", google_maps_search_url(q.get("linked_name",""), q.get("area","")), use_container_width=True)
-        fav_col = cols[2]
-
-        if fav_col.button("お気に入り" if not favorite else "解除する", key=f"{ui_scope}_fav_{q['quest_id']}", use_container_width=True):
-            if favorite: st.session_state.favorites.remove(q["quest_id"])
-            else: st.session_state.favorites.add(q["quest_id"])
-            save_user_data() # ★ 自動保存
-            st.rerun()
+        cols = st.columns(2)
+        if q.get("official_url"):
+            cols[0].link_button("🔗 公式ページ", q.get("official_url",""), use_container_width=True)
+        cols[1].link_button("🗺️ Googleマップ", google_maps_search_url(q.get("linked_name",""), q.get("area","")), use_container_width=True)
 
         if show_actions:
             with st.expander("📝 記録を書いておく（タップして展開）", expanded=False):
@@ -2622,7 +2646,7 @@ def render_usage_guide() -> None:
 対象スポットへ行き、GPS判定と写真添付を行うとクリアできます。
 
 **③ キャラクターとリンゴを獲得**  
-クエストをクリアするとキャラクターとリンゴを獲得。図鑑では「進化まで一気に」でまとめてリンゴをあげられます。
+クエストをクリアするとキャラクターとリンゴを獲得できます。
 
 **④ ストーリーモードにも挑戦**  
 天草四郎ゆかりの地を順番に巡るモードです。前の章をクリアすると次の章が解放されます。
@@ -2736,11 +2760,179 @@ def render_survey() -> None:
 # =====================================================================
 # ★ UI構築
 # =====================================================================
-st.set_page_config(page_title="天草つながりクエスト", page_icon="🌊", layout="wide")
-init_state()
+st.set_page_config(
+    page_title="天草つながりクエスト",
+    page_icon="🌊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-st.title("🌊 天草つながりクエスト")
-st.caption("実在する天草の施設・祭り・地域イベントだけをクエスト化するプロトタイプ")
+def apply_charming_blue_theme() -> None:
+    """スマホでも見やすい、青を基調にしたチャーミングなUI。"""
+    st.markdown(
+        """
+        <style>
+        :root {
+          --ama-blue: #1479d3;
+          --ama-blue-dark: #075aa8;
+          --ama-sky: #55bde9;
+          --ama-pale: #edf8ff;
+          --ama-pale-2: #f7fcff;
+          --ama-ink: #16324a;
+          --ama-border: #cfeafa;
+        }
+        .stApp {
+          background:
+            radial-gradient(circle at 8% 0%, rgba(85,189,233,.18), transparent 28%),
+            radial-gradient(circle at 92% 8%, rgba(20,121,211,.10), transparent 24%),
+            linear-gradient(180deg, #f7fcff 0%, #ffffff 48%, #f5fbff 100%);
+          color: var(--ama-ink);
+        }
+        [data-testid="stMainBlockContainer"] {
+          max-width: 1120px;
+          padding-top: 1.1rem;
+          padding-bottom: 5rem;
+        }
+        .amakusa-hero {
+          position: relative;
+          overflow: hidden;
+          padding: 20px 22px;
+          margin: 2px 0 14px;
+          border: 1px solid rgba(255,255,255,.9);
+          border-radius: 26px;
+          background: linear-gradient(135deg, #0b6fc5 0%, #35aee1 58%, #7bd5ef 100%);
+          box-shadow: 0 12px 34px rgba(18, 112, 184, .22);
+          color: white;
+        }
+        .amakusa-hero:after {
+          content: "◌  ◦  ○  ◌";
+          position: absolute;
+          right: 16px;
+          top: 8px;
+          font-size: 34px;
+          letter-spacing: 5px;
+          color: rgba(255,255,255,.25);
+        }
+        .amakusa-hero-title {
+          position: relative; z-index: 1;
+          font-size: clamp(26px, 5vw, 40px);
+          line-height: 1.1;
+          font-weight: 900;
+          letter-spacing: .02em;
+        }
+        .amakusa-hero-sub {
+          position: relative; z-index: 1;
+          margin-top: 8px;
+          font-size: 14px;
+          font-weight: 700;
+          opacity: .95;
+        }
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+          border-color: var(--ama-border) !important;
+          border-radius: 20px !important;
+          background: rgba(255,255,255,.94);
+          box-shadow: 0 5px 18px rgba(30, 116, 176, .07);
+        }
+        div[data-testid="stExpander"] {
+          border: 1px solid var(--ama-border);
+          border-radius: 16px;
+          overflow: hidden;
+          background: rgba(255,255,255,.92);
+        }
+        div[data-testid="stExpander"] summary {
+          color: var(--ama-blue-dark);
+          font-weight: 800;
+        }
+        .stButton > button, .stLinkButton > a {
+          min-height: 46px;
+          border-radius: 14px !important;
+          font-weight: 800 !important;
+          border-color: #b9ddf5 !important;
+        }
+        .stButton > button[kind="primary"] {
+          background: linear-gradient(135deg, var(--ama-blue-dark), var(--ama-blue)) !important;
+          border: none !important;
+          box-shadow: 0 7px 16px rgba(11,111,197,.22);
+        }
+        [data-testid="stNotification"] {
+          border-radius: 15px;
+        }
+        [data-baseweb="tab-list"] {
+          gap: 6px;
+          overflow-x: auto;
+          scrollbar-width: none;
+          padding: 4px 2px 8px;
+        }
+        [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+        [data-baseweb="tab"] {
+          flex: 0 0 auto;
+          min-height: 42px;
+          padding: 8px 13px;
+          border-radius: 999px;
+          background: #eaf7ff;
+          color: #23628f;
+          font-weight: 800;
+          white-space: nowrap;
+        }
+        [aria-selected="true"][data-baseweb="tab"] {
+          background: linear-gradient(135deg, #dff3ff, #cceeff);
+          color: #075aa8;
+        }
+        [data-baseweb="select"] > div, .stTextInput input, .stTextArea textarea {
+          border-radius: 13px !important;
+          border-color: #cde6f7 !important;
+          background: #fbfeff !important;
+        }
+        [data-testid="stMetric"] {
+          background: #f0f9ff;
+          border: 1px solid #d7effc;
+          border-radius: 16px;
+          padding: 10px 12px;
+        }
+        [data-testid="stImage"] img { border-radius: 16px; }
+        iframe { border-radius: 18px !important; }
+        h1, h2, h3 { color: #125f9d; }
+
+        @media (max-width: 768px) {
+          [data-testid="stMainBlockContainer"] {
+            padding: .65rem .72rem 4.5rem;
+          }
+          .amakusa-hero {
+            padding: 18px 16px;
+            border-radius: 20px;
+            margin-bottom: 10px;
+          }
+          .amakusa-hero-title { font-size: 28px; }
+          .amakusa-hero-sub { font-size: 13px; max-width: 88%; }
+          .stButton > button, .stLinkButton > a { min-height: 48px; font-size: 15px; }
+          [data-baseweb="tab"] { min-height: 44px; padding: 9px 12px; }
+          [data-testid="stHorizontalBlock"] { flex-wrap: wrap; gap: .55rem; }
+          [data-testid="column"] { min-width: min(100%, 250px); flex: 1 1 250px !important; }
+          h2 { font-size: 1.45rem !important; }
+          h3 { font-size: 1.18rem !important; }
+          p, .stMarkdown { line-height: 1.7; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_app_hero() -> None:
+    st.markdown(
+        """
+        <div class="amakusa-hero">
+          <div class="amakusa-hero-title">🌊 天草つながりクエスト</div>
+          <div class="amakusa-hero-sub">天草をめぐって、見つけて、集める。あなたの旅をクエストにしよう。</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+init_state()
+apply_charming_blue_theme()
+render_app_hero()
 
 render_participant_setup()
 if not st.session_state.get("data_loaded", False):
@@ -2803,15 +2995,15 @@ global_focus_qid = _get_query_param("focus_qid")
 if global_focus_qid:
     global_focus_q = get_quest(global_focus_qid)
     if global_focus_q.get("quest_id"):
-        st.markdown("## 🧭 マップから選択されたクエスト")
+        st.markdown("## ✨ 選んだクエスト")
         if is_story_quest(global_focus_q) and not story_is_unlocked(global_focus_q):
             render_locked_story_card(global_focus_q, ui_scope=f"global_focus_{global_focus_qid}")
         else:
             quest_card(display_quest_for_list(global_focus_q), show_actions=True, ui_scope=f"global_focus_{global_focus_qid}")
         st.divider()
 
-main_tab, list_tab, story_tab, map_tab, character_tab, fav_tab, summary_tab, survey_tab, db_tab = st.tabs([
-    "🌟 おすすめクエスト", "🔍 全クエストモード", "📜 ストーリー", "👣 足跡マップ・日記", "🎁 キャラクター図鑑 & 育成", "⭐ お気に入り", "🎒 旅のまとめ", "📝 アンケート", "⚙️ データ確認"
+main_tab, list_tab, story_tab, map_tab, character_tab, summary_tab, survey_tab = st.tabs([
+    "🌟 おすすめ", "🗺️ 全クエスト", "📖 ストーリー", "👣 旅日記", "🎁 図鑑", "🎒 旅まとめ", "📝 アンケート"
 ])
 
 with main_tab:
@@ -2825,27 +3017,31 @@ with main_tab:
             quest_card(q, show_actions=True, ui_scope=f"main_{i}_{q['quest_id']}")
 
 with list_tab:
-    st.subheader("🔍 全クエストモード")
-    st.write("目的やエリアで絞り込んで、好きなクエストを探せます。ストーリーモードの未解放章は、場所名をシークレットとして表示します。")
-    focused_qid = _get_query_param("focus_qid")
-    
-    f_cols = st.columns(4)
-    sel_tag = f_cols[0].selectbox("目的", ["すべて"] + OBJECTIVES)
-    sel_area = f_cols[1].selectbox("エリア", ["すべて", "上天草", "天草", "苓北"])
-    sel_season = f_cols[2].selectbox("行く時期", SEASONS, index=6)
-    kw = f_cols[3].text_input("キーワード検索", key="list_kw", placeholder="例：イルカ、海鮮")
-    
+    st.subheader("🔍 全クエスト")
+    st.write("地図や条件から、今行きたいクエストを探せます。")
+    focused_qid = _get_query_param("focus_qid") or st.session_state.get("map_selected_qid", "")
+
+    with st.expander("🔎 条件で絞り込む", expanded=False):
+        filter_row1 = st.columns(2)
+        sel_tag = filter_row1[0].selectbox("目的", ["すべて"] + OBJECTIVES)
+        sel_area = filter_row1[1].selectbox("エリア", ["すべて", "上天草", "天草", "苓北"])
+        filter_row2 = st.columns(2)
+        sel_season = filter_row2[0].selectbox("行く時期", SEASONS, index=6)
+        kw = filter_row2[1].text_input("キーワード", key="list_kw", placeholder="例：イルカ、海鮮")
+
     obj_filter = [sel_tag] if sel_tag != "すべて" else []
     area_filter = sel_area if sel_area != "すべて" else "指定なし"
-    
+
     f_quests = recommend_quests(obj_filter, "まだ決めていない", sel_season, area_filter, kw, include_story=True)
 
-    # 目的・エリア選択と、該当クエスト一覧の間にマップを表示する。
-    render_quest_map(f_quests, map_title="🗺️ クエストマップ")
+    # 地図のピンをタップすると、選んだクエストを直下に表示する。
+    map_selected_qid = render_quest_map(f_quests, map_title="🗺️ 地図から選ぶ")
+    if map_selected_qid:
+        focused_qid = map_selected_qid
 
     focused_q = next((q for q in f_quests if q.get("quest_id") == focused_qid), None)
     if focused_q:
-        st.markdown("### 🧭 マップから選択されたクエスト")
+        st.markdown("### ✨ 選んだクエスト")
         if is_story_quest(focused_q) and not story_is_unlocked(focused_q):
             render_locked_story_card(focused_q, ui_scope=f"focused_{focused_qid}")
         else:
@@ -2930,16 +3126,6 @@ with map_tab: render_footprint_map()
 with character_tab: render_character_collection()
 
 
-with fav_tab:
-    st.subheader("⭐ お気に入り")
-    favs = [get_quest(q) for q in st.session_state.favorites if get_quest(q).get("quest_id")]
-    if not favs: st.info("お気に入りはありません。")
-    else: 
-        cols = st.columns(3)
-        for i, q in enumerate(favs): 
-            with cols[i % 3]:
-                quest_card(q, ui_scope=f"fav_{i}")
-
 with summary_tab:
     st.subheader("🎒 旅のまとめ")
     done = [get_quest(q) for q in st.session_state.completed if get_quest(q).get("quest_id")]
@@ -2953,23 +3139,25 @@ with summary_tab:
 with survey_tab:
     render_survey()
 
-with db_tab:
-    st.subheader("⚙️ データ確認・表紙写真の登録")
-    st.write("各クエストの表紙写真（マスターイメージ）をここで簡単に登録・変更できます。")
-    q_name = st.selectbox("写真を登録するクエストを選択", [q.get("quest_name","") for q in QUESTS])
-    target_q = next((q for q in QUESTS if q.get("quest_name","") == q_name), None)
-    if target_q:
-        existing_photo = place_photo_path(target_q["quest_id"])
-        if existing_photo:
-            st.image(str(existing_photo), caption="現在登録されている表紙写真", width=300)
-        else:
-            st.info("現在、写真は未登録（仮イラスト）です。")
-
-        up_file = st.file_uploader(f"「{q_name}」の新しい写真をアップロード", type=["jpg", "jpeg", "png", "webp"])
-        if up_file:
-            save_place_photo(target_q["quest_id"], up_file)
-            st.success("表紙写真を登録しました！おすすめ画面などに反映されます。")
-            st.rerun()
-
+# 管理機能は通常利用者には見せず、URLに ?admin=1 を付けた時だけ表示する。
+if _get_query_param("admin") == "1":
     st.divider()
-    st.download_button("クエストDBのCSVダウンロード", pd.DataFrame(QUESTS).to_csv(index=False).encode("utf-8-sig"), "db.csv", "text/csv")
+    with st.expander("⚙️ 管理者用メニュー", expanded=False):
+        st.subheader("データ確認・表紙写真の登録")
+        st.write("各クエストの表紙写真（マスターイメージ）を登録・変更できます。")
+        q_name = st.selectbox("写真を登録するクエストを選択", [q.get("quest_name","") for q in QUESTS])
+        target_q = next((q for q in QUESTS if q.get("quest_name","") == q_name), None)
+        if target_q:
+            existing_photo = place_photo_path(target_q["quest_id"])
+            if existing_photo:
+                st.image(str(existing_photo), caption="現在登録されている表紙写真", width=300)
+            else:
+                st.info("現在、写真は未登録（仮イラスト）です。")
+
+            up_file = st.file_uploader(f"「{q_name}」の新しい写真をアップロード", type=["jpg", "jpeg", "png", "webp"])
+            if up_file:
+                save_place_photo(target_q["quest_id"], up_file)
+                st.success("表紙写真を登録しました！おすすめ画面などに反映されます。")
+                st.rerun()
+
+        st.download_button("クエストDBのCSVダウンロード", pd.DataFrame(QUESTS).to_csv(index=False).encode("utf-8-sig"), "db.csv", "text/csv")

@@ -1254,6 +1254,85 @@ def _apply_state_dict(data: Dict, include_photo_binary: bool = True) -> None:
         st.session_state.photo_data = photo_data
 
 
+
+def save_survey_to_quest_progress(payload: Dict) -> bool:
+    """
+    アンケート回答を quest_progress の quest_id='__survey__' に確実に保存する。
+    同じニックネームの回答がすでに存在する場合は、その行を更新する。
+    """
+    pid = st.session_state.get("participant_id", "").strip()
+
+    if not pid or not supabase_is_configured():
+        return False
+
+    supabase = get_supabase_client()
+    if supabase is None:
+        return False
+
+    ensure_participant(pid)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    submitted_at = (
+        payload.get("submitted_at")
+        or st.session_state.get("survey_submitted_at")
+        or now_iso
+    )
+
+    row = {
+        "participant_id": pid,
+        "quest_id": APP_SURVEY_QUEST_ID,
+        "completed": True,
+        "completed_at": submitted_at,
+        "favorite": False,
+        "note": json.dumps(payload, ensure_ascii=False),
+        "photo_uploaded": False,
+        "apples": int(st.session_state.get("apples", 0)),
+        "updated_at": now_iso,
+    }
+
+    # 既存行の有無を確認。
+    # composite unique 制約が無いDBでも動くよう、upsertだけに依存しない。
+    existing = (
+        supabase
+        .table("quest_progress")
+        .select("id")
+        .eq("participant_id", pid)
+        .eq("quest_id", APP_SURVEY_QUEST_ID)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        row_id = existing.data[0].get("id")
+
+        if row_id is not None:
+            (
+                supabase
+                .table("quest_progress")
+                .update(row)
+                .eq("id", row_id)
+                .execute()
+            )
+        else:
+            (
+                supabase
+                .table("quest_progress")
+                .update(row)
+                .eq("participant_id", pid)
+                .eq("quest_id", APP_SURVEY_QUEST_ID)
+                .execute()
+            )
+    else:
+        (
+            supabase
+            .table("quest_progress")
+            .insert(row)
+            .execute()
+        )
+
+    return True
+
+
 def save_user_data():
     """
     データ保存の入口。
@@ -2800,8 +2879,41 @@ def render_survey() -> None:
             st.session_state.survey_answers = payload
             st.session_state.survey_submitted = True
             st.session_state.survey_submitted_at = payload["submitted_at"]
-            save_user_data()
-            st.success("ご回答ありがとうございました！アンケートを保存しました。")
+
+            survey_saved = False
+            survey_error = None
+
+            if supabase_is_configured():
+                try:
+                    survey_saved = save_survey_to_quest_progress(payload)
+                except Exception as e:
+                    survey_error = e
+
+            # クエスト進捗・アプリ全体の状態も従来どおり保存
+            try:
+                save_user_data()
+            except Exception as e:
+                if survey_error is None:
+                    survey_error = e
+
+            if survey_saved:
+                st.success(
+                    "ご回答ありがとうございました！"
+                    "アンケートを quest_progress に保存しました。"
+                )
+                st.caption(
+                    "Supabaseでは quest_id が「__survey__」の行に回答内容が保存されています。"
+                )
+            elif supabase_is_configured() and survey_error is not None:
+                st.error(
+                    "アンケートをSupabaseに保存できませんでした。"
+                    f"エラー: {survey_error}"
+                )
+            else:
+                st.warning(
+                    "アンケートはこの端末に保存しましたが、"
+                    "Supabaseへの接続を確認できませんでした。"
+                )
 
 
 # =====================================================================

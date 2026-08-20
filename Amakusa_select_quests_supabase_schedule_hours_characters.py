@@ -3303,20 +3303,173 @@ if _get_query_param("admin") == "1":
     st.divider()
     with st.expander("⚙️ 管理者用メニュー", expanded=False):
         st.subheader("データ確認・表紙写真の登録")
-        st.write("各クエストの表紙写真（マスターイメージ）を登録・変更できます。")
-        q_name = st.selectbox("写真を登録するクエストを選択", [q.get("quest_name","") for q in QUESTS])
-        target_q = next((q for q in QUESTS if q.get("quest_name","") == q_name), None)
-        if target_q:
-            existing_photo = place_photo_path(target_q["quest_id"])
-            if existing_photo:
-                st.image(str(existing_photo), caption="現在登録されている表紙写真", width=300)
-            else:
-                st.info("現在、写真は未登録（仮イラスト）です。")
+        st.write("通常クエストとストーリーモードの表紙写真を登録・変更できます。")
 
-            up_file = st.file_uploader(f"「{q_name}」の新しい写真をアップロード", type=["jpg", "jpeg", "png", "webp"])
-            if up_file:
-                save_place_photo(target_q["quest_id"], up_file)
-                st.success("表紙写真を登録しました！おすすめ画面などに反映されます。")
-                st.rerun()
+        admin_photo_tab, admin_story_photo_tab = st.tabs(
+            ["📍 通常クエスト", "📖 ストーリーモード"]
+        )
 
-        st.download_button("クエストDBのCSVダウンロード", pd.DataFrame(QUESTS).to_csv(index=False).encode("utf-8-sig"), "db.csv", "text/csv")
+        # -------------------------------------------------------------
+        # 通常クエストの表紙写真
+        # -------------------------------------------------------------
+        with admin_photo_tab:
+            st.markdown("### 通常クエストの表紙写真")
+
+            normal_options = {
+                f"{q.get('quest_name','')}｜{q.get('linked_name','')}": q
+                for q in QUESTS
+            }
+
+            normal_label = st.selectbox(
+                "写真を登録する通常クエストを選択",
+                list(normal_options.keys()),
+                key="admin_normal_photo_quest",
+            )
+
+            target_q = normal_options.get(normal_label)
+
+            if target_q:
+                existing_photo = place_photo_path(target_q["quest_id"])
+
+                if existing_photo:
+                    st.image(
+                        str(existing_photo),
+                        caption=f"現在の表紙写真：{target_q.get('linked_name','')}",
+                        width=320,
+                    )
+                else:
+                    st.info("現在、写真は未登録（仮イラスト）です。")
+
+                up_file = st.file_uploader(
+                    f"「{target_q.get('quest_name','')}」の新しい写真をアップロード",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"admin_normal_photo_upload_{target_q['quest_id']}",
+                )
+
+                if up_file is not None:
+                    if st.button(
+                        "この写真を通常クエストの表紙に設定",
+                        key=f"admin_normal_photo_save_{target_q['quest_id']}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        save_place_photo(target_q["quest_id"], up_file)
+                        st.success("通常クエストの表紙写真を登録しました。")
+                        st.rerun()
+
+        # -------------------------------------------------------------
+        # ストーリーモードの表紙写真
+        # -------------------------------------------------------------
+        with admin_story_photo_tab:
+            st.markdown("### ストーリーモードの表紙写真")
+            st.caption(
+                "第1章〜第6章の目的地写真を登録できます。"
+                "登録した写真はストーリーモードの各章に表示されます。"
+            )
+
+            story_options = {
+                f"第{i+1}章｜{q.get('quest_name','')}｜{q.get('linked_name','')}": q
+                for i, q in enumerate(STORY_QUESTS)
+            }
+
+            story_label = st.selectbox(
+                "写真を登録するストーリークエストを選択",
+                list(story_options.keys()),
+                key="admin_story_photo_quest",
+            )
+
+            target_story_q = story_options.get(story_label)
+
+            if target_story_q:
+                st.markdown(
+                    f"**目的地：** {target_story_q.get('linked_name','')}"
+                )
+
+                existing_story_photo = place_photo_path(
+                    target_story_q["quest_id"]
+                )
+
+                if existing_story_photo:
+                    st.image(
+                        str(existing_story_photo),
+                        caption=(
+                            "現在登録されているストーリー表紙写真："
+                            f"{target_story_q.get('linked_name','')}"
+                        ),
+                        width=320,
+                    )
+
+                    if st.button(
+                        "現在のストーリー表紙写真を削除",
+                        key=f"admin_story_photo_delete_{target_story_q['quest_id']}",
+                        use_container_width=True,
+                    ):
+                        for ext in PLACE_PHOTO_EXTS:
+                            old_photo = (
+                                PLACE_PHOTO_DIR
+                                / f"{target_story_q['quest_id']}.{ext}"
+                            )
+                            if old_photo.exists():
+                                old_photo.unlink()
+
+                        st.success(
+                            "ストーリーモードの表紙写真を削除しました。"
+                        )
+                        st.rerun()
+                else:
+                    st.info(
+                        "現在、この章の表紙写真は未登録です。"
+                        "登録するまでは仮イラストが表示されます。"
+                    )
+
+                story_up_file = st.file_uploader(
+                    (
+                        f"「{target_story_q.get('quest_name','')}」"
+                        "の表紙写真をアップロード"
+                    ),
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"admin_story_photo_upload_{target_story_q['quest_id']}",
+                )
+
+                if story_up_file is not None:
+                    st.image(
+                        story_up_file,
+                        caption="登録前のプレビュー",
+                        width=320,
+                    )
+
+                    if st.button(
+                        "この写真をストーリーモードの表紙に設定",
+                        key=f"admin_story_photo_save_{target_story_q['quest_id']}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        save_place_photo(
+                            target_story_q["quest_id"],
+                            story_up_file,
+                        )
+                        st.success(
+                            "ストーリーモードの表紙写真を登録しました。"
+                            "各章の画面に反映されます。"
+                        )
+                        st.rerun()
+
+        st.divider()
+
+        st.download_button(
+            "通常クエストDBのCSVダウンロード",
+            pd.DataFrame(QUESTS)
+            .to_csv(index=False)
+            .encode("utf-8-sig"),
+            "db.csv",
+            "text/csv",
+        )
+
+        st.download_button(
+            "ストーリークエストDBのCSVダウンロード",
+            pd.DataFrame(STORY_QUESTS)
+            .to_csv(index=False)
+            .encode("utf-8-sig"),
+            "story_db.csv",
+            "text/csv",
+        )

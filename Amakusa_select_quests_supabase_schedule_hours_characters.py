@@ -1909,6 +1909,61 @@ def render_custom_diary_creator():
 
 
 
+
+def replace_custom_diary_photo(entry, uploaded_file):
+    """
+    保存済みの自由旅日記写真を後から差し替える。
+    新しい写真を先にSupabase Storageへ保存し、成功後に古い写真を削除する。
+    戻り値: (成功, メッセージ)
+    """
+    if uploaded_file is None:
+        return False, "新しい写真を選択してください。"
+
+    entry_id = str(entry.get("entry_id", "") or "").strip()
+    if not entry_id:
+        return False, "旅日記IDが見つかりません。"
+
+    old_path = str(entry.get("photo_storage_path", "") or "")
+
+    ok, new_path, error = upload_photo_bytes_to_supabase(
+        qid=f"custom_replace_{entry_id}",
+        raw=uploaded_file.getvalue(),
+        filename=getattr(uploaded_file, "name", "photo.jpg"),
+        mime=getattr(uploaded_file, "type", None) or "image/jpeg",
+    )
+
+    if not ok:
+        return False, error or "新しい写真の保存に失敗しました。"
+
+    # 共通アップロード関数側では自由旅日記の古いpathを知らないため、ここで削除
+    if old_path and old_path != new_path and supabase_configured():
+        try:
+            (
+                get_supabase_client()
+                .storage
+                .from_(diary_photo_bucket())
+                .remove([old_path])
+            )
+        except Exception:
+            # 削除に失敗しても新しい写真は有効なので続行
+            pass
+
+    entry["photo_storage_path"] = new_path
+    entry["updated_at"] = jp_now().isoformat()
+
+    try:
+        saved_ok = save_custom_diary_entry(entry)
+    except Exception as e:
+        return False, f"旅日記の更新保存に失敗しました。（{e}）"
+
+    save_user_data()
+
+    if not saved_ok and supabase_configured():
+        return False, "旅日記の更新をSupabaseへ保存できませんでした。"
+
+    return True, "写真を変更しました。"
+
+
 def render_custom_diary_entries():
     entries = [
         e for e in st.session_state.custom_diary_entries
@@ -1939,11 +1994,83 @@ def render_custom_diary_entries():
                 key=f"custom_entry_date_{entry_id}",
             )
 
+            st.markdown("#### 📷 写真")
             photo_url = custom_diary_photo_signed_url(e)
             if photo_url:
-                st.image(photo_url, use_container_width=True)
+                st.image(
+                    photo_url,
+                    caption="現在登録されている写真",
+                    use_container_width=True,
+                )
             elif e.get("photo_storage_path"):
                 st.success("📷 写真は登録済みです。")
+            else:
+                st.caption("写真はまだ登録されていません。")
+
+            edit_flag_key = f"custom_entry_photo_edit_{entry_id}"
+            if edit_flag_key not in st.session_state:
+                st.session_state[edit_flag_key] = False
+
+            if not st.session_state[edit_flag_key]:
+                button_label = (
+                    "🔄 写真を変更する"
+                    if e.get("photo_storage_path")
+                    else "📷 写真を追加する"
+                )
+                if st.button(
+                    button_label,
+                    key=f"open_custom_entry_photo_edit_{entry_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state[edit_flag_key] = True
+                    st.rerun()
+            else:
+                st.info(
+                    "新しい写真を選択して保存すると、現在の写真と入れ替わります。"
+                )
+
+                replacement_upload = st.file_uploader(
+                    "新しい写真を選択",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"replace_custom_entry_photo_{entry_id}",
+                )
+
+                if replacement_upload is not None:
+                    st.image(
+                        replacement_upload.getvalue(),
+                        caption="変更後の写真（まだ保存されていません）",
+                        use_container_width=True,
+                    )
+
+                pc1, pc2 = st.columns(2)
+
+                with pc1:
+                    if st.button(
+                        "✅ この写真に変更",
+                        key=f"save_custom_entry_photo_{entry_id}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=replacement_upload is None,
+                    ):
+                        ok, msg = replace_custom_diary_photo(
+                            e,
+                            replacement_upload,
+                        )
+                        if ok:
+                            st.session_state[edit_flag_key] = False
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+                with pc2:
+                    if st.button(
+                        "キャンセル",
+                        key=f"cancel_custom_entry_photo_{entry_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[edit_flag_key] = False
+                        st.rerun()
 
             edited_note = st.text_area(
                 "感想",
@@ -1976,6 +2103,7 @@ def render_custom_diary_entries():
                 e["visited_date"] = edited_date.isoformat()
                 e["note"] = edited_note.strip()
                 e["visibility"] = edited_visibility
+                e["updated_at"] = jp_now().isoformat()
 
                 try:
                     ok = save_custom_diary_entry(e)

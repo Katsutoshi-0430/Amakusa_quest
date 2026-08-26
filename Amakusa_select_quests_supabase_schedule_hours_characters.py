@@ -44,6 +44,7 @@ IMG_EXTS = ["jpg", "jpeg", "png", "webp", "JPG", "JPEG", "PNG", "WEBP"]
 APP_STATE_QUEST_ID = "__app_state__"
 SURVEY_QUEST_ID = "__survey__"
 PUBLIC_DIARY_PREFIX = "__public_diary__::"
+CUSTOM_DIARY_PREFIX = "__custom_diary__::"
 
 AGE_OPTIONS = ["選択してください", "10代", "20代", "30代", "40代", "50代", "60代", "70代以上"]
 FEATURE_SURVEY_ITEMS = [
@@ -198,7 +199,7 @@ def get_quest(qid):
     return next((q for q in QUESTS + STORY_QUESTS if q["quest_id"] == qid), {})
 
 def init_state():
-    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, quest_session_ended=False, quest_end_feedback={}, map_selected_qid="", nickname="")
+    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, quest_session_ended=False, quest_end_feedback={}, map_selected_qid="", nickname="", quest_visit_dates={}, custom_diary_entries=[], custom_diary_draft_lat=None, custom_diary_draft_lon=None)
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
@@ -210,7 +211,7 @@ def state_dict():
         "quest_character_rewards": st.session_state.quest_character_rewards, "apples": st.session_state.apples, "character_apples": st.session_state.character_apples,
         "last_login_date": st.session_state.last_login_date, "story_progress": st.session_state.story_progress, "profile_age": st.session_state.profile_age,
         "guide_seen": st.session_state.guide_seen, "survey_answers": st.session_state.survey_answers, "survey_submitted": st.session_state.survey_submitted,
-        "survey_submitted_at": st.session_state.survey_submitted_at, "quest_session_ended": st.session_state.quest_session_ended, "quest_end_feedback": st.session_state.quest_end_feedback, "nickname": st.session_state.nickname, "participant_id": st.session_state.participant_id,
+        "survey_submitted_at": st.session_state.survey_submitted_at, "quest_session_ended": st.session_state.quest_session_ended, "quest_end_feedback": st.session_state.quest_end_feedback, "nickname": st.session_state.nickname, "participant_id": st.session_state.participant_id, "quest_visit_dates": st.session_state.quest_visit_dates, "custom_diary_entries": st.session_state.custom_diary_entries,
     }
 
 def apply_state(d):
@@ -1135,8 +1136,30 @@ def save_app_state_supabase():
 
 def save_quest_supabase(qid):
     pid = st.session_state.participant_id.strip()
-    if not pid or not supabase_configured(): return False
-    return upsert_progress({"participant_id": pid, "quest_id": qid, "completed": qid in st.session_state.completed, "completed_at": st.session_state.completed_at.get(qid), "favorite": qid in st.session_state.favorites, "note": st.session_state.notes.get(qid, ""), "photo_uploaded": bool(st.session_state.photos.get(qid) or st.session_state.photo_storage_paths.get(qid)), "sns_text": st.session_state.sns_texts.get(qid, ""), "x_post_url": "", "character_id": st.session_state.quest_character_rewards.get(qid, "")})
+    if not pid or not supabase_configured():
+        return False
+
+    completed_at = st.session_state.completed_at.get(qid)
+    visit_date = st.session_state.quest_visit_dates.get(qid)
+    if visit_date:
+        # DB上でも実際に行った日が分かるよう、日付をcompleted_atへ反映
+        completed_at = f"{visit_date}T12:00:00+09:00"
+
+    return upsert_progress({
+        "participant_id": pid,
+        "quest_id": qid,
+        "completed": qid in st.session_state.completed,
+        "completed_at": completed_at,
+        "favorite": qid in st.session_state.favorites,
+        "note": st.session_state.notes.get(qid, ""),
+        "photo_uploaded": bool(
+            st.session_state.photos.get(qid)
+            or st.session_state.photo_storage_paths.get(qid)
+        ),
+        "sns_text": st.session_state.sns_texts.get(qid, ""),
+        "x_post_url": "",
+        "character_id": st.session_state.quest_character_rewards.get(qid, ""),
+    })
 
 
 QUEST_FEEDBACK_PREFIX = "__quest_feedback__::"
@@ -1255,6 +1278,10 @@ def load_user_data():
                 if load_quest_end_feedback_from_row(r):
                     continue
 
+                # 自由旅日記も通常クエスト進捗とは別に読む
+                if load_custom_diary_from_row(r):
+                    continue
+
                 if not qid or qid in {APP_STATE_QUEST_ID, SURVEY_QUEST_ID} or not get_quest(qid):
                     continue
 
@@ -1264,6 +1291,10 @@ def load_user_data():
                         st.session_state.completed_order.append(qid)
                     if r.get("completed_at"):
                         st.session_state.completed_at[qid] = r["completed_at"]
+                        try:
+                            st.session_state.quest_visit_dates[qid] = str(r["completed_at"])[:10]
+                        except Exception:
+                            pass
 
                 if r.get("note") is not None:
                     st.session_state.notes[qid] = r.get("note") or ""
@@ -1423,6 +1454,14 @@ def quest_card(q, scope):
         c1, c2 = st.columns(2)
         if q.get("official_url"): c1.link_button("公式情報", q["official_url"], use_container_width=True)
         c2.link_button("Googleマップ", google_maps_url(original), use_container_width=True)
+        visit_day = st.date_input(
+            "📅 行った日",
+            value=visit_date_default(qid),
+            max_value=date.today(),
+            key=f"{scope}_visit_date_{qid}",
+        )
+        st.session_state.quest_visit_dates[qid] = visit_day.isoformat()
+
         note = st.text_area("旅のメモ・感想", value=st.session_state.notes.get(qid, ""), key=f"{scope}_note_{qid}")
         st.session_state.notes[qid] = note
         st.markdown("#### 📷 クエスト・旅日記の写真")
@@ -1488,8 +1527,257 @@ def render_map(qs):
         folium.Marker(c, tooltip=d["linked_name"], popup=folium.Popup(f"<b>{html.escape(d['linked_name'])}</b><br>{html.escape(d['quest_name'])}", max_width=280), icon=folium.Icon(color=color, icon="flag")).add_to(m)
     st_folium(m, width=None, height=500, key="main_quest_map")
 
+
+def visit_date_default(qid):
+    """クエストの訪問日。未登録ならクリア日または今日を初期値にする。"""
+    saved = str(st.session_state.quest_visit_dates.get(qid, "") or "").strip()
+    if saved:
+        try:
+            return date.fromisoformat(saved[:10])
+        except Exception:
+            pass
+
+    completed = str(st.session_state.completed_at.get(qid, "") or "").strip()
+    if completed:
+        try:
+            return date.fromisoformat(completed[:10])
+        except Exception:
+            pass
+
+    return date.today()
+
+
+def save_custom_diary_entry(entry):
+    """
+    自由旅日記を既存quest_progressへJSON保存する。
+    専用テーブルを追加しなくても参加者ごとに再読込できる。
+    """
+    pid = st.session_state.participant_id.strip()
+    if not pid or not supabase_configured():
+        return False
+
+    entry_id = str(entry.get("entry_id", "") or "").strip()
+    if not entry_id:
+        entry_id = uuid.uuid4().hex
+        entry["entry_id"] = entry_id
+
+    qid = f"{CUSTOM_DIARY_PREFIX}{entry_id}"
+
+    row = {
+        "participant_id": pid,
+        "quest_id": qid,
+        "completed": True,
+        "completed_at": entry.get("visited_date") or jp_now().date().isoformat(),
+        "favorite": False,
+        "note": json.dumps(entry, ensure_ascii=False),
+        "photo_uploaded": bool(entry.get("photo_storage_path")),
+        "sns_text": "",
+        "x_post_url": "",
+        "character_id": "",
+    }
+    return upsert_progress(row)
+
+
+def load_custom_diary_from_row(row):
+    qid = str(row.get("quest_id", "") or "")
+    if not qid.startswith(CUSTOM_DIARY_PREFIX):
+        return False
+
+    try:
+        payload = json.loads(row.get("note") or "{}")
+    except Exception:
+        return True
+
+    if not isinstance(payload, dict):
+        return True
+
+    entry_id = str(payload.get("entry_id", "") or qid[len(CUSTOM_DIARY_PREFIX):])
+    payload["entry_id"] = entry_id
+
+    existing_ids = {
+        str(e.get("entry_id", ""))
+        for e in st.session_state.custom_diary_entries
+        if isinstance(e, dict)
+    }
+    if entry_id not in existing_ids:
+        st.session_state.custom_diary_entries.append(payload)
+    return True
+
+
+def custom_diary_photo_signed_url(entry):
+    path = str(entry.get("photo_storage_path", "") or "")
+    return diary_photo_signed_url_from_path(path) if path else ""
+
+
+def render_custom_diary_creator():
+    st.markdown("### 📌 自由に旅の足跡を追加")
+    st.caption("地図をタップして好きな場所にピンを立て、写真・感想・行った日を記録できます。")
+
+    if folium is None or st_folium is None:
+        st.warning("自由ピン機能には folium と streamlit-folium が必要です。")
+        return
+
+    m = folium.Map(location=[32.43, 130.19], zoom_start=9, tiles="OpenStreetMap")
+
+    # 既存の自由ピンも表示
+    for e in st.session_state.custom_diary_entries:
+        try:
+            lat = float(e.get("lat"))
+            lon = float(e.get("lon"))
+        except Exception:
+            continue
+        title = html.escape(str(e.get("title", "旅の記録")))
+        folium.Marker(
+            [lat, lon],
+            tooltip=title,
+            icon=folium.Icon(color="purple", icon="camera"),
+        ).add_to(m)
+
+    clicked = st_folium(
+        m,
+        width=None,
+        height=430,
+        key="custom_diary_pin_map",
+    )
+
+    last_clicked = (clicked or {}).get("last_clicked") if isinstance(clicked, dict) else None
+    if last_clicked:
+        st.session_state.custom_diary_draft_lat = last_clicked.get("lat")
+        st.session_state.custom_diary_draft_lon = last_clicked.get("lng")
+
+    lat = st.session_state.custom_diary_draft_lat
+    lon = st.session_state.custom_diary_draft_lon
+
+    if lat is None or lon is None:
+        st.info("地図上の記録したい場所をタップしてください。")
+        return
+
+    st.success(f"📍 ピン位置：{float(lat):.5f}, {float(lon):.5f}")
+
+    with st.form("custom_diary_form", clear_on_submit=False):
+        title = st.text_input(
+            "場所・タイトル",
+            placeholder="例：海沿いで見つけた夕日スポット",
+            max_chars=60,
+        )
+        visited_date = st.date_input(
+            "行った日",
+            value=date.today(),
+            max_value=date.today(),
+        )
+        note = st.text_area(
+            "旅のメモ・感想",
+            placeholder="この場所で感じたこと、見つけたことを書いてください。",
+            height=110,
+        )
+        upload = st.file_uploader(
+            "写真を追加（任意）",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="custom_diary_photo_upload",
+        )
+        submitted = st.form_submit_button(
+            "📌 この場所を旅日記に追加",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if not title.strip():
+            st.error("場所・タイトルを入力してください。")
+            return
+
+        entry_id = uuid.uuid4().hex
+        storage_path = ""
+
+        if upload is not None:
+            ok, storage_path, error = upload_photo_bytes_to_supabase(
+                qid=f"custom_{entry_id}",
+                raw=upload.getvalue(),
+                filename=getattr(upload, "name", "photo.jpg"),
+                mime=getattr(upload, "type", None) or "image/jpeg",
+            )
+            if not ok:
+                st.warning(
+                    "写真の共有保存に失敗しました。写真なしで旅日記を保存します。"
+                    + (f"（{error}）" if error else "")
+                )
+                storage_path = ""
+
+        entry = {
+            "entry_id": entry_id,
+            "title": title.strip(),
+            "visited_date": visited_date.isoformat(),
+            "note": note.strip(),
+            "lat": float(lat),
+            "lon": float(lon),
+            "photo_storage_path": storage_path,
+            "created_at": jp_now().isoformat(),
+        }
+
+        st.session_state.custom_diary_entries.append(entry)
+
+        saved_ok = True
+        try:
+            saved_ok = save_custom_diary_entry(entry)
+        except Exception:
+            saved_ok = False
+
+        save_user_data()
+
+        if saved_ok or not supabase_configured():
+            st.success("自由旅日記を追加しました。")
+        else:
+            st.warning("端末には保存しましたが、Supabaseへの保存に失敗しました。")
+
+        st.session_state.custom_diary_draft_lat = None
+        st.session_state.custom_diary_draft_lon = None
+        st.rerun()
+
+
+def render_custom_diary_entries():
+    entries = [
+        e for e in st.session_state.custom_diary_entries
+        if isinstance(e, dict)
+    ]
+    if not entries:
+        return
+
+    st.markdown("### 📍 自由に追加した旅日記")
+
+    for e in sorted(
+        entries,
+        key=lambda x: str(x.get("visited_date", "")),
+        reverse=True,
+    ):
+        with st.container(border=True):
+            st.markdown(f"**📌 {e.get('title', '旅の記録')}**")
+            st.caption(f"行った日：{e.get('visited_date', '')}")
+
+            photo_url = custom_diary_photo_signed_url(e)
+            if photo_url:
+                st.image(photo_url, use_container_width=True)
+
+            if e.get("note"):
+                st.write(e["note"])
+
+            try:
+                lat = float(e.get("lat"))
+                lon = float(e.get("lon"))
+                st.link_button(
+                    "Googleマップで場所を見る",
+                    f"https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+
+
 def render_private_diary():
     st.subheader("🔒 自分の旅日記")
+
+    render_custom_diary_creator()
+    render_custom_diary_entries()
+    st.divider()
 
     done = [
         qid
@@ -1518,7 +1806,14 @@ def render_private_diary():
         q = get_quest(qid)
         with st.container(border=True):
             st.markdown(f"**{q['linked_name']}**")
-            st.caption(st.session_state.completed_at.get(qid, "")[:10])
+
+            diary_visit_day = st.date_input(
+                "📅 行った日",
+                value=visit_date_default(qid),
+                max_value=date.today(),
+                key=f"diary_visit_date_{qid}",
+            )
+            st.session_state.quest_visit_dates[qid] = diary_visit_day.isoformat()
 
             render_registered_photo_editor(
                 qid,
@@ -1652,7 +1947,11 @@ def render_summary():
     st.subheader("🎒 旅のまとめ"); done = [qid for qid in st.session_state.completed_order if qid in st.session_state.completed]
     c1, c2, c3 = st.columns(3); c1.metric("クリア", len(done)); c2.metric("ストーリー", st.session_state.story_progress); c3.metric("仲間", len(st.session_state.unlocked_character_ids))
     if done:
-        rows = [{"日付": st.session_state.completed_at.get(qid, "")[:10], "場所": get_quest(qid)["linked_name"], "エリア": classified_area(get_quest(qid))} for qid in done]
+        rows = [{
+            "日付": st.session_state.quest_visit_dates.get(qid) or st.session_state.completed_at.get(qid, "")[:10],
+            "場所": get_quest(qid)["linked_name"],
+            "エリア": classified_area(get_quest(qid)),
+        } for qid in done]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 

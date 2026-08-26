@@ -2168,6 +2168,30 @@ with c1:
 with c2:
     done_normal = len([q for q in QUESTS if q["quest_id"] in st.session_state.completed]); st.progress(done_normal/len(QUESTS), text=f"参加した通常クエスト：{done_normal}/{len(QUESTS)}")
 
+# ログインボーナス直下にも、長いアンケートへ移動できるボタンを設置
+st.markdown("#### 📝 テストマーケティングアンケート")
+st.caption("旅のまとめ横にあるアンケートと同じ内容です。いつでもここから回答できます。")
+if st.button(
+    "📝 アンケートに回答する",
+    key="open_main_survey_button",
+    type="secondary",
+    use_container_width=True,
+):
+    st.session_state.open_survey_from_top = True
+    st.rerun()
+
+if st.session_state.get("open_survey_from_top", False):
+    with st.container(border=True):
+        st.markdown("### 📝 テストマーケティング アンケート")
+        if st.button(
+            "閉じる",
+            key="close_main_survey_button",
+            use_container_width=True,
+        ):
+            st.session_state.open_survey_from_top = False
+            st.rerun()
+        render_survey()
+
 
 # GPSによるCLEAR判定は廃止。
 # クエスト場所の固定座標はマップ表示のみに使用します。

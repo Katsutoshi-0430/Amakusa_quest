@@ -197,7 +197,7 @@ def get_quest(qid):
     return next((q for q in QUESTS + STORY_QUESTS if q["quest_id"] == qid), {})
 
 def init_state():
-    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, map_selected_qid="", nickname="")
+    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, quest_session_ended=False, quest_end_feedback={}, map_selected_qid="", nickname="")
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
@@ -209,7 +209,7 @@ def state_dict():
         "quest_character_rewards": st.session_state.quest_character_rewards, "apples": st.session_state.apples, "character_apples": st.session_state.character_apples,
         "last_login_date": st.session_state.last_login_date, "story_progress": st.session_state.story_progress, "profile_age": st.session_state.profile_age,
         "guide_seen": st.session_state.guide_seen, "survey_answers": st.session_state.survey_answers, "survey_submitted": st.session_state.survey_submitted,
-        "survey_submitted_at": st.session_state.survey_submitted_at, "nickname": st.session_state.nickname, "participant_id": st.session_state.participant_id,
+        "survey_submitted_at": st.session_state.survey_submitted_at, "quest_session_ended": st.session_state.quest_session_ended, "quest_end_feedback": st.session_state.quest_end_feedback, "nickname": st.session_state.nickname, "participant_id": st.session_state.participant_id,
     }
 
 def apply_state(d):
@@ -734,6 +734,54 @@ def save_quest_supabase(qid):
     if not pid or not supabase_configured(): return False
     return upsert_progress({"participant_id": pid, "quest_id": qid, "completed": qid in st.session_state.completed, "completed_at": st.session_state.completed_at.get(qid), "favorite": qid in st.session_state.favorites, "note": st.session_state.notes.get(qid, ""), "photo_uploaded": bool(st.session_state.photos.get(qid) or st.session_state.photo_storage_paths.get(qid)), "sns_text": st.session_state.sns_texts.get(qid, ""), "x_post_url": "", "character_id": st.session_state.quest_character_rewards.get(qid, "")})
 
+
+QUEST_FEEDBACK_PREFIX = "__quest_feedback__::"
+
+def quest_feedback_row_id(qid):
+    return f"{QUEST_FEEDBACK_PREFIX}{qid}"
+
+def save_quest_end_feedback(qid, payload):
+    """
+    既存の全体アンケートとは別に、
+    クエストごとの3問アンケートを quest_progress にJSON保存する。
+    DBの列追加は不要。
+    """
+    pid = st.session_state.participant_id.strip()
+    if not pid or not supabase_configured():
+        return False
+
+    row = {
+        "participant_id": pid,
+        "quest_id": quest_feedback_row_id(qid),
+        "completed": True,
+        "completed_at": payload.get("submitted_at"),
+        "favorite": False,
+        "note": json.dumps(payload, ensure_ascii=False),
+        "photo_uploaded": False,
+        "sns_text": "",
+        "x_post_url": "",
+        "character_id": "",
+    }
+    return upsert_progress(row)
+
+def load_quest_end_feedback_from_row(row):
+    qid = str(row.get("quest_id", ""))
+    if not qid.startswith(QUEST_FEEDBACK_PREFIX):
+        return False
+
+    actual_qid = qid[len(QUEST_FEEDBACK_PREFIX):]
+    if not get_quest(actual_qid):
+        return True
+
+    try:
+        payload = json.loads(row.get("note") or "{}")
+        if isinstance(payload, dict):
+            st.session_state.quest_end_feedback[actual_qid] = payload
+    except Exception:
+        pass
+
+    return True
+
 def save_survey_to_quest_progress(payload):
     pid = st.session_state.participant_id.strip()
     if not pid or not supabase_configured(): return False
@@ -767,6 +815,11 @@ def load_user_data():
 
             for r in rows:
                 qid = r.get("quest_id")
+
+                # クエスト終了時の3問アンケートは通常クエスト進捗とは別に読む
+                if load_quest_end_feedback_from_row(r):
+                    continue
+
                 if not qid or qid in {APP_STATE_QUEST_ID, SURVEY_QUEST_ID} or not get_quest(qid):
                     continue
 
@@ -932,7 +985,6 @@ def quest_card(q, scope):
     with st.container(border=True):
         st.markdown(f"### {'✅' if done else '📍'} {q['quest_name']}"); st.caption(f"{'クリア済み' if done else '未クリア'} / {classified_purpose(original)} / {classified_area(original)}")
         render_place_photo(original); st.write(q.get("description", "")); st.markdown(f"**場所：** {q.get('linked_name','')}"); st.markdown(f"**達成条件：** {q.get('condition','')}"); schedule_notice(original)
-        d = distance(original); st.markdown(f"**現在地から：** {fmt_dist(d)}")
         c1, c2 = st.columns(2)
         if q.get("official_url"): c1.link_button("公式情報", q["official_url"], use_container_width=True)
         c2.link_button("Googleマップ", google_maps_url(original), use_container_width=True)
@@ -944,15 +996,25 @@ def quest_card(q, scope):
         st.markdown("#### 🌍 公開設定")
         render_visibility_selector(qid, scope)
 
-        gps_ok = True
-        if st.session_state.gps_required:
-            gps_ok = d is not None and d <= st.session_state.gps_radius_m
-            if gps_ok: st.success(f"📍 GPS判定OK：{fmt_dist(d)}")
-            elif d is None: st.warning("現在地を取得してください。")
-            else: st.warning(f"達成範囲外です。現在：{fmt_dist(d)} / 判定半径：{st.session_state.gps_radius_m}m")
-        photo_ok = bool(st.session_state.photos.get(qid) or st.session_state.photo_storage_paths.get(qid))
-        if not photo_ok: st.info("クリアには写真添付が必要です。")
-        if st.button("もう一度クリア演出を見る" if done else "🎉 クエストをクリアする", key=f"{scope}_clear_{qid}", type="primary", disabled=not(gps_ok and photo_ok), use_container_width=True): complete_quest(original); st.rerun()
+        # CLEAR判定は写真のみ。
+        # GPS現在地が一致していなくても写真を登録すればCLEARできる。
+        photo_ok = bool(
+            st.session_state.photos.get(qid)
+            or st.session_state.photo_storage_paths.get(qid)
+        )
+
+        if not photo_ok:
+            st.info("📷 クエストクリアには写真の登録が必要です。")
+
+        if st.button(
+            "もう一度クリア演出を見る" if done else "🎉 クエストをクリアする",
+            key=f"{scope}_clear_{qid}",
+            type="primary",
+            disabled=not photo_ok,
+            use_container_width=True,
+        ):
+            complete_quest(original)
+            st.rerun()
         if done:
             if st.button(
                 "💾 旅日記・公開設定を保存",
@@ -1158,6 +1220,201 @@ def render_summary():
         rows = [{"日付": st.session_state.completed_at.get(qid, "")[:10], "場所": get_quest(qid)["linked_name"], "エリア": classified_area(get_quest(qid))} for qid in done]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+
+# =====================================================================
+# クエスト終了画面（旅のまとめ + クエスト別3問アンケート）
+# =====================================================================
+
+def star_rating_options():
+    return [
+        "★1",
+        "★2",
+        "★3",
+        "★4",
+        "★5",
+    ]
+
+def star_value(label):
+    try:
+        return int(str(label).replace("★", "").strip())
+    except Exception:
+        return None
+
+def render_end_feedback_for_quest(qid):
+    q = get_quest(qid)
+    if not q:
+        return
+
+    saved = dict(
+        st.session_state.quest_end_feedback.get(qid, {})
+        or {}
+    )
+
+    rating_options = star_rating_options()
+
+    fun_default = saved.get("fun_rating")
+    motive_default = saved.get("character_motivation_rating")
+
+    fun_idx = (
+        max(0, min(int(fun_default) - 1, 4))
+        if fun_default in {1, 2, 3, 4, 5}
+        else None
+    )
+    motive_idx = (
+        max(0, min(int(motive_default) - 1, 4))
+        if motive_default in {1, 2, 3, 4, 5}
+        else None
+    )
+
+    with st.container(border=True):
+        st.markdown(f"### 📍 {q.get('linked_name', '')}")
+        st.caption(q.get("quest_name", ""))
+
+        with st.form(f"quest_end_feedback_form_{qid}"):
+            fun_label = st.radio(
+                "**Q1. このクエストは楽しかったですか？**",
+                rating_options,
+                index=fun_idx,
+                horizontal=True,
+                key=f"end_fun_{qid}",
+            )
+
+            motive_label = st.radio(
+                "**Q2. キャラクターを獲得できることは、この場所を訪れる動機になりましたか？**",
+                rating_options,
+                index=motive_idx,
+                horizontal=True,
+                key=f"end_motive_{qid}",
+            )
+
+            improvement = st.text_area(
+                "**Q3. 改善してほしい点・分かりにくかった点があれば教えてください。（任意）**",
+                value=saved.get("improvement", ""),
+                height=110,
+                key=f"end_improve_{qid}",
+            )
+
+            submit = st.form_submit_button(
+                "このクエストの回答を保存",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submit:
+            if fun_label is None or motive_label is None:
+                st.error("Q1とQ2は★1〜5のいずれかを選択してください。")
+            else:
+                payload = {
+                    "quest_id": qid,
+                    "quest_name": q.get("quest_name", ""),
+                    "linked_name": q.get("linked_name", ""),
+                    "fun_rating": star_value(fun_label),
+                    "character_motivation_rating": star_value(motive_label),
+                    "improvement": improvement.strip(),
+                    "submitted_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                st.session_state.quest_end_feedback[qid] = payload
+                save_user_data()
+
+                saved_ok = False
+                err = None
+                try:
+                    saved_ok = save_quest_end_feedback(qid, payload)
+                except Exception as e:
+                    err = e
+
+                if saved_ok:
+                    st.success("回答を保存しました。ありがとうございます！")
+                elif err:
+                    st.warning(
+                        "端末には保存しましたが、Supabaseへの保存に失敗しました。"
+                        f" エラー: {err}"
+                    )
+                else:
+                    st.success("回答を保存しました。")
+
+        if saved:
+            st.caption("✅ このクエストは回答済みです。再回答すると内容を更新できます。")
+
+def render_quest_end_screen():
+    st.markdown(
+        """
+        <div style="
+            padding:24px 22px;
+            border-radius:24px;
+            background:linear-gradient(135deg,#1479d3,#55bde9);
+            color:white;
+            text-align:center;
+            margin:10px 0 18px;
+        ">
+          <div style="font-size:31px;font-weight:900;">🏁 クエスト終了</div>
+          <div style="font-size:15px;margin-top:8px;">
+            天草での旅、おつかれさまでした。<br>
+            旅の記録を振り返り、クリアしたクエストについて教えてください。
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("## 🎒 今回の旅のまとめ")
+    render_summary()
+
+    completed_ids = [
+        qid
+        for qid in st.session_state.completed_order
+        if qid in st.session_state.completed and get_quest(qid)
+    ]
+
+    st.divider()
+    st.markdown("## ⭐ クエスト終了アンケート")
+    st.caption(
+        "現在の全体アンケートとは別の、クエストごとの3問アンケートです。"
+        "Q1・Q2は★1〜5、Q3は任意回答です。"
+    )
+
+    if not completed_ids:
+        st.info(
+            "まだクリアしたクエストがありません。"
+            "写真を登録してクエストをCLEARすると、ここにアンケートが表示されます。"
+        )
+    else:
+        answered_count = len(
+            [
+                qid
+                for qid in completed_ids
+                if qid in st.session_state.quest_end_feedback
+            ]
+        )
+
+        st.progress(
+            answered_count / len(completed_ids),
+            text=f"回答済み：{answered_count} / {len(completed_ids)} クエスト",
+        )
+
+        for qid in completed_ids:
+            render_end_feedback_for_quest(qid)
+
+    st.divider()
+
+    back_col, survey_col = st.columns(2)
+
+    with back_col:
+        if st.button(
+            "← クエスト画面に戻る",
+            use_container_width=True,
+        ):
+            st.session_state.quest_session_ended = False
+            save_user_data()
+            st.rerun()
+
+    with survey_col:
+        st.caption(
+            "全体アンケートは従来どおり「📝 アンケート」から回答できます。"
+        )
+
+
 # =====================================================================
 # アンケート（旅行消費・掲載店送客効果追加版）
 # =====================================================================
@@ -1261,7 +1518,7 @@ def apply_theme():
 
 def usage_guide():
     with st.expander("📘 はじめての方へ｜アプリの使い方", expanded=not st.session_state.guide_seen):
-        st.markdown("**① クエストを選ぶ** → **② 現地でGPS・写真判定** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記は「🔒 プライベート / 🌍 全体公開」を選べる** → **⑥ 全体公開を選ぶと「みんなの足跡」に表示** → **⑦ 最後にアンケート回答**")
+        st.markdown("**① クエストを選ぶ** → **② 現地で写真を登録してCLEAR** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記は「🔒 プライベート / 🌍 全体公開」を選べる** → **⑥ 全体公開を選ぶと「みんなの足跡」に表示** → **⑦ 最後に「🏁 クエスト終了」から旅を振り返る**")
         if not st.session_state.guide_seen and st.button("✅ 使い方を確認しました", use_container_width=True): st.session_state.guide_seen = True; save_user_data(); st.rerun()
 
 def recommend(qs, purpose, area, season, kw):
@@ -1401,6 +1658,43 @@ with st.expander("👤 参加者名を変更する"):
 
 usage_guide(); render_clear_effect()
 
+# -------------------------------------------------------------
+# ★ わかりやすい「クエスト終了」ボタン
+# 1件以上CLEARしたら押せる。押すと通常画面から終了画面へ切り替える。
+# -------------------------------------------------------------
+completed_for_end = [
+    qid
+    for qid in st.session_state.completed_order
+    if qid in st.session_state.completed and get_quest(qid)
+]
+
+end_left, end_right = st.columns([2.2, 1])
+
+with end_left:
+    st.caption(
+        "写真を登録するとクエストCLEARできます。"
+        "GPSによるCLEAR判定はありません。"
+    )
+
+with end_right:
+    if st.button(
+        "🏁 クエスト終了・旅を振り返る",
+        type="primary",
+        use_container_width=True,
+        disabled=len(completed_for_end) == 0,
+    ):
+        st.session_state.quest_session_ended = True
+        save_user_data()
+        st.rerun()
+
+# 終了後は通常のクエスト画面を隠して、
+# 「旅のまとめ + クエスト別3問アンケート」に切り替える。
+if st.session_state.quest_session_ended:
+    render_quest_end_screen()
+    st.divider()
+    st.caption("天草つながりクエスト｜テストマーケティング版")
+    st.stop()
+
 c1, c2 = st.columns(2)
 with c1:
     today = date.today().isoformat()
@@ -1410,15 +1704,9 @@ with c1:
 with c2:
     done_normal = len([q for q in QUESTS if q["quest_id"] in st.session_state.completed]); st.progress(done_normal/len(QUESTS), text=f"参加した通常クエスト：{done_normal}/{len(QUESTS)}")
 
-with st.expander("⚙️ GPS・デモ用現在地設定"):
-    st.session_state.gps_required = st.checkbox("GPSで訪問判定する", value=st.session_state.gps_required); st.session_state.gps_radius_m = st.slider("達成判定半径", 50, 1000, int(st.session_state.gps_radius_m), 50)
-    if get_geolocation is not None and st.button("📍 ブラウザGPSで現在地を取得", use_container_width=True):
-        p = get_geolocation(); coords = p.get("coords", p) if isinstance(p, dict) else {}
-        try: set_location(float(coords["latitude"]), float(coords["longitude"]), coords.get("accuracy"), "ブラウザGPS"); st.rerun()
-        except Exception: st.warning("位置情報を取得できませんでした。ブラウザの位置情報許可を確認してください。")
-    demo = st.selectbox("デモ用：クエスト地点を現在地にする", ["選択しない"] + [q["quest_id"] for q in QUESTS + STORY_QUESTS], format_func=lambda x: x if x == "選択しない" else get_quest(x)["linked_name"])
-    if demo != "選択しない" and st.button("この地点に設定", use_container_width=True): c = QUEST_COORDS[demo]; set_location(c[0], c[1], 5, "デモ"); st.rerun()
-    if current_location(): st.success(f"現在地：{current_location()[0]:.6f}, {current_location()[1]:.6f}")
+
+# GPSによるCLEAR判定は廃止。
+# クエスト場所の固定座標はマップ表示のみに使用します。
 
 main_tab, list_tab, story_tab, diary_tab, char_tab, summary_tab, survey_tab = st.tabs(["🌟 おすすめ", "🗺️ 全クエスト", "📖 ストーリー", "👣 旅日記", "🎁 図鑑", "🎒 旅まとめ", "📝 アンケート"])
 with main_tab:

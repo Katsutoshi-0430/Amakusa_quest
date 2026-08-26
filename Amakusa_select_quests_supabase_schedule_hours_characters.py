@@ -894,7 +894,7 @@ def render_registered_photo_editor(qid, scope):
 
 
 def normalize_nickname(value):
-    """重複判定用。前後空白・全角空白・大文字小文字の差を吸収する。"""
+    """名前照合用。前後空白・全角空白・大文字小文字の差を吸収する。"""
     value = str(value or "").replace("\u3000", " ").strip()
     value = re.sub(r"\s+", " ", value)
     return value.casefold()
@@ -923,46 +923,86 @@ def get_participant_by_id(participant_id):
         return None
 
 
-def nickname_is_taken(nickname, exclude_participant_id=""):
+def find_participant_by_nickname(nickname):
     """
-    同じ参加者自身を除き、同名ニックネームが既に使われているか確認する。
-    DB側のunique制約と併用する前提。
+    ニックネームから既存参加者を探す。
+    1) participants.nickname / participants.name
+    2) quest_progress の __app_state__ に保存された nickname
+    の順に検索する。
+
+    これにより、長い participant_id を再入力しなくても
+    同じニックネームで過去の進捗へ戻れる。
     """
     target = normalize_nickname(nickname)
     if not target or not supabase_configured():
-        return False
+        return None
 
     sb = get_supabase_client()
     if sb is None:
-        return False
+        return None
 
+    # まずparticipantsテーブルの名前列を確認
     try:
         rows = sb.table("participants").select("*").execute().data or []
+        for row in rows:
+            existing_name = row.get("nickname", row.get("name", ""))
+            if normalize_nickname(existing_name) == target:
+                return {
+                    "participant_id": str(row.get("participant_id", "") or "").strip(),
+                    "nickname": str(existing_name or nickname).strip(),
+                }
     except Exception:
-        return False
+        pass
 
+    # nickname列が無い既存DBでも動くよう、アプリ状態JSONから探す
+    try:
+        rows = (
+            sb.table("quest_progress")
+            .select("participant_id,quest_id,note")
+            .eq("quest_id", APP_STATE_QUEST_ID)
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            try:
+                state = json.loads(row.get("note") or "{}")
+            except Exception:
+                continue
+            if not isinstance(state, dict):
+                continue
+            existing_name = str(state.get("nickname", "") or "").strip()
+            if normalize_nickname(existing_name) == target:
+                return {
+                    "participant_id": str(row.get("participant_id", "") or "").strip(),
+                    "nickname": existing_name,
+                }
+    except Exception:
+        pass
+
+    return None
+
+
+def nickname_is_taken(nickname, exclude_participant_id=""):
+    """別の参加者が同じニックネームを使っているか確認する。"""
+    found = find_participant_by_nickname(nickname)
+    if not found:
+        return False
     exclude_pid = str(exclude_participant_id or "").strip()
-    for row in rows:
-        pid = str(row.get("participant_id", "") or "").strip()
-        if exclude_pid and pid == exclude_pid:
-            continue
-        existing_name = row.get("nickname", row.get("name", ""))
-        if normalize_nickname(existing_name) == target:
-            return True
-    return False
+    return not (exclude_pid and found.get("participant_id") == exclude_pid)
 
 
 def register_participant(participant_id, nickname):
     """
-    participantsテーブルへ参加者を先に登録する。
-    quest_progress保存前に必ず親レコードを作り、外部キーエラーを防ぐ。
+    quest_progress保存より先にparticipantsへ親レコードを作る。
+    nickname列の有無に依存しないよう、participant_idだけでも登録できる設計。
     戻り値: (成功, メッセージ)
     """
     pid = str(participant_id or "").strip()
     nick = str(nickname or "").replace("\u3000", " ").strip()
 
-    if not pid or not nick:
-        return False, "参加者IDまたは参加者名がありません。"
+    if not pid:
+        return False, "参加者IDを作成できませんでした。"
     if not supabase_configured():
         return True, ""
 
@@ -970,65 +1010,66 @@ def register_participant(participant_id, nickname):
     if sb is None:
         return False, "Supabaseに接続できません。"
 
-    current = get_participant_by_id(pid)
-    if current:
-        # 既存IDなら同一人物として扱う
-        current_name = current.get("nickname", current.get("name", ""))
-        if current_name != nick:
-            try:
-                sb.table("participants").update({
-                    "nickname": nick,
-                }).eq("participant_id", pid).execute()
-            except Exception:
-                # nickname列が未作成の場合は、後段で分かりやすいエラーにする
-                pass
+    if get_participant_by_id(pid):
         return True, ""
 
-    if nickname_is_taken(nick):
-        return False, "この参加者名はすでに使われています。別の名前を入力してください。"
+    # 同名が既に存在する場合は、新規登録ではなくログイン側で扱う
+    existing = find_participant_by_nickname(nick) if nick else None
+    if existing and existing.get("participant_id") != pid:
+        return False, "この参加者名はすでに登録されています。"
 
-    payload = {
-        "participant_id": pid,
-        "nickname": nick,
-    }
-
+    # まずnickname列つきで試す
     try:
-        sb.table("participants").insert(payload).execute()
+        sb.table("participants").insert({
+            "participant_id": pid,
+            "nickname": nick,
+        }).execute()
         return True, ""
-    except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        if "duplicate" in low or "unique" in low or "23505" in low:
-            return False, "この参加者名はすでに使われています。別の名前を入力してください。"
-        if "nickname" in low and ("column" in low or "schema" in low):
-            return False, (
-                "Supabaseのparticipantsテーブルにnickname列がありません。"
-                "先にnickname列とUNIQUE制約を追加してください。"
-            )
-        return False, f"参加者情報の登録に失敗しました。（{msg}）"
+    except Exception as e1:
+        msg1 = str(e1)
+
+        # 既存DBにnickname列が無い場合はparticipant_idだけで登録
+        try:
+            sb.table("participants").insert({
+                "participant_id": pid,
+            }).execute()
+            return True, ""
+        except Exception as e2:
+            msg2 = str(e2)
+            low = (msg1 + " " + msg2).lower()
+            if "duplicate" in low or "unique" in low or "23505" in low:
+                # participant_idが既にあるなら成功扱い
+                if get_participant_by_id(pid):
+                    return True, ""
+                return False, "この参加者名はすでに登録されています。"
+            return False, f"参加者情報の登録に失敗しました。（{msg2}）"
 
 
 def ensure_current_participant():
     """
     quest_progress保存前の安全弁。
-    participantsに親レコードが無い場合は現在のID・名前で作成する。
+    participantsに親レコードが無ければ現在のIDで自動作成する。
     """
     pid = str(st.session_state.get("participant_id", "") or "").strip()
     nick = str(st.session_state.get("nickname", "") or "").strip()
+
     if not pid:
         return False
     if not supabase_configured():
         return True
-
     if get_participant_by_id(pid):
         return True
 
-    ok, _ = register_participant(pid, nick or "参加者")
+    ok, _ = register_participant(pid, nick)
     return ok
 
 
 def update_participant_nickname(participant_id, new_nickname):
-    """既存参加者の名前変更。重複名は拒否する。"""
+    """
+    参加者名変更。
+    同名の別参加者がいる場合は拒否。
+    nickname列が無いDBでも、__app_state__ に保存されるため継続利用できる。
+    """
     pid = str(participant_id or "").strip()
     nick = str(new_nickname or "").replace("\u3000", " ").strip()
 
@@ -1036,6 +1077,7 @@ def update_participant_nickname(participant_id, new_nickname):
         return False, "参加者名を入力してください。"
     if nickname_is_taken(nick, exclude_participant_id=pid):
         return False, "この参加者名はすでに使われています。別の名前を入力してください。"
+
     if not supabase_configured():
         return True, ""
 
@@ -1043,14 +1085,15 @@ def update_participant_nickname(participant_id, new_nickname):
     if sb is None:
         return False, "Supabaseに接続できません。"
 
+    # nickname列があれば同期。無ければ無視し、app_state側の名前を正とする。
     try:
         sb.table("participants").update({
             "nickname": nick,
         }).eq("participant_id", pid).execute()
-        return True, ""
-    except Exception as e:
-        return False, f"参加者名の変更に失敗しました。（{e}）"
+    except Exception:
+        pass
 
+    return True, ""
 
 def upsert_progress(row):
     sb = get_supabase_client()
@@ -1144,9 +1187,31 @@ def load_quest_end_feedback_from_row(row):
     return True
 
 def save_survey_to_quest_progress(payload):
+    """
+    アンケートを現在の参加者に紐づけて保存する。
+    participants親レコードを先に保証し、foreign keyエラーを防ぐ。
+    """
     pid = st.session_state.participant_id.strip()
-    if not pid or not supabase_configured(): return False
-    return upsert_progress({"participant_id": pid, "quest_id": SURVEY_QUEST_ID, "completed": True, "completed_at": payload["submitted_at"], "favorite": False, "note": json.dumps(payload, ensure_ascii=False), "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""})
+    if not pid or not supabase_configured():
+        return False
+
+    if not ensure_current_participant():
+        raise RuntimeError(
+            "参加者情報をSupabaseのparticipantsテーブルへ登録できませんでした。"
+        )
+
+    return upsert_progress({
+        "participant_id": pid,
+        "quest_id": SURVEY_QUEST_ID,
+        "completed": True,
+        "completed_at": payload["submitted_at"],
+        "favorite": False,
+        "note": json.dumps(payload, ensure_ascii=False),
+        "photo_uploaded": False,
+        "sns_text": "",
+        "x_post_url": "",
+        "character_id": "",
+    })
 
 def save_user_data():
     try: SAVE_FILE.write_text(json.dumps(state_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1962,39 +2027,45 @@ if not str(st.session_state.get("nickname", "")).strip():
     if start_button:
         if not first_name:
             st.error("参加者のお名前を入力してください。")
-        elif nickname_is_taken(first_name):
-            st.error(
-                "この参加者名はすでに登録されています。"
-                "別の名前を入力してください。"
-            )
         else:
-            # URLにpidがない参加者には自動で一意の参加者IDを発行する。
-            if not str(st.session_state.get("participant_id", "")).strip():
-                st.session_state.participant_id = (
-                    "AMK-" + uuid.uuid4().hex[:10].upper()
-                )
+            # 同じニックネームがあれば「新規登録」ではなく前回データへログインする。
+            existing = find_participant_by_nickname(first_name)
 
-            # quest_progressより先にparticipantsへ登録する。
-            # これによりforeign keyエラーを防ぎ、進捗をparticipant_id単位で永続化する。
-            ok, msg = register_participant(
-                st.session_state.participant_id,
-                first_name,
-            )
+            if existing and existing.get("participant_id"):
+                st.session_state.participant_id = existing["participant_id"]
+                st.session_state.nickname = existing.get("nickname") or first_name
 
-            if not ok:
-                st.error(msg)
-            else:
-                st.session_state.nickname = first_name
+                # 既存参加者の進捗・図鑑・日記・アンケート等を読み直す
+                load_user_data()
+                st.session_state.data_loaded = True
 
-                # 自動発行した参加者IDをURLにも残し、
-                # 再訪時に同じparticipant_idから同じ進捗を読み込む。
                 try:
                     st.query_params["pid"] = st.session_state.participant_id
                 except Exception:
                     pass
 
-                save_user_data()
+                st.success("前回の旅のデータを読み込みました。")
                 st.rerun()
+
+            else:
+                # 未登録の名前だけ新規参加者として作成する。
+                new_pid = "AMK-" + uuid.uuid4().hex[:10].upper()
+
+                ok, msg = register_participant(new_pid, first_name)
+                if not ok:
+                    st.error(msg)
+                else:
+                    st.session_state.participant_id = new_pid
+                    st.session_state.nickname = first_name
+
+                    try:
+                        st.query_params["pid"] = st.session_state.participant_id
+                    except Exception:
+                        pass
+
+                    # app_stateを含め、最初の状態をSupabaseへ保存
+                    save_user_data()
+                    st.rerun()
 
     # 名前入力が終わるまでは下のアプリ画面を表示しない。
     st.stop()

@@ -8,6 +8,7 @@ import json
 import math
 import re
 import urllib.parse
+import uuid
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -208,7 +209,7 @@ def state_dict():
         "quest_character_rewards": st.session_state.quest_character_rewards, "apples": st.session_state.apples, "character_apples": st.session_state.character_apples,
         "last_login_date": st.session_state.last_login_date, "story_progress": st.session_state.story_progress, "profile_age": st.session_state.profile_age,
         "guide_seen": st.session_state.guide_seen, "survey_answers": st.session_state.survey_answers, "survey_submitted": st.session_state.survey_submitted,
-        "survey_submitted_at": st.session_state.survey_submitted_at, "nickname": st.session_state.nickname,
+        "survey_submitted_at": st.session_state.survey_submitted_at, "nickname": st.session_state.nickname, "participant_id": st.session_state.participant_id,
     }
 
 def apply_state(d):
@@ -258,31 +259,60 @@ def save_user_data():
 
 def load_user_data():
     pid = st.session_state.participant_id.strip()
-    if pid and supabase_configured():
+
+    # Streamlit Community Cloud などSupabase運用時は、参加者IDごとに読み込む。
+    # participant_id がない新規参加者に共有ローカルsaveを読み込ませないことで、
+    # 他の参加者の名前や進捗が表示されることを防ぐ。
+    if supabase_configured():
+        if not pid:
+            return
         try:
             rows = get_supabase_client().table("quest_progress").select("*").eq("participant_id", pid).execute().data or []
             app = next((r for r in rows if r.get("quest_id") == APP_STATE_QUEST_ID), None)
-            if app and app.get("note"): apply_state(json.loads(app["note"]))
+            if app and app.get("note"):
+                apply_state(json.loads(app["note"]))
+
             survey = next((r for r in rows if r.get("quest_id") == SURVEY_QUEST_ID), None)
             if survey and survey.get("note"):
-                st.session_state.survey_answers = json.loads(survey["note"]); st.session_state.survey_submitted = True
+                st.session_state.survey_answers = json.loads(survey["note"])
+                st.session_state.survey_submitted = True
+
             for r in rows:
                 qid = r.get("quest_id")
-                if not qid or qid in {APP_STATE_QUEST_ID, SURVEY_QUEST_ID} or not get_quest(qid): continue
+                if not qid or qid in {APP_STATE_QUEST_ID, SURVEY_QUEST_ID} or not get_quest(qid):
+                    continue
+
                 if r.get("completed"):
                     st.session_state.completed.add(qid)
-                    if qid not in st.session_state.completed_order: st.session_state.completed_order.append(qid)
-                    if r.get("completed_at"): st.session_state.completed_at[qid] = r["completed_at"]
-                if r.get("note") is not None: st.session_state.notes[qid] = r.get("note") or ""
-                if r.get("photo_uploaded"): st.session_state.photos[qid] = "写真添付済み"
+                    if qid not in st.session_state.completed_order:
+                        st.session_state.completed_order.append(qid)
+                    if r.get("completed_at"):
+                        st.session_state.completed_at[qid] = r["completed_at"]
+
+                if r.get("note") is not None:
+                    st.session_state.notes[qid] = r.get("note") or ""
+
+                if r.get("photo_uploaded"):
+                    st.session_state.photos[qid] = "写真添付済み"
+
                 if r.get("character_id"):
-                    cid = r["character_id"]; st.session_state.quest_character_rewards[qid] = cid; st.session_state.unlocked_character_ids.add(cid)
-                    if cid not in st.session_state.unlocked_character_order: st.session_state.unlocked_character_order.append(cid)
+                    cid = r["character_id"]
+                    st.session_state.quest_character_rewards[qid] = cid
+                    st.session_state.unlocked_character_ids.add(cid)
+                    if cid not in st.session_state.unlocked_character_order:
+                        st.session_state.unlocked_character_order.append(cid)
             return
-        except Exception: pass
+        except Exception:
+            # 参加者データの混同を避けるため、Supabase設定済みの本番環境では
+            # 接続エラー時に共有ローカルsaveへフォールバックしない。
+            return
+
+    # Supabase未設定のローカル開発時のみローカルsaveを利用。
     if SAVE_FILE.exists():
-        try: apply_state(json.loads(SAVE_FILE.read_text(encoding="utf-8")))
-        except Exception: pass
+        try:
+            apply_state(json.loads(SAVE_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
 
 # =====================================================================
 # 分類・画像・GPS
@@ -573,7 +603,12 @@ def render_survey():
 # UI
 # =====================================================================
 def apply_theme():
-    st.markdown('''<style>.stApp{background:linear-gradient(180deg,#f8fdff,#fff 45%,#f4fbff)}[data-testid="stMainBlockContainer"]{max-width:1180px;padding-top:1rem}.hero{padding:24px;border-radius:24px;background:linear-gradient(135deg,#1479d3,#55bde9);color:#fff;box-shadow:0 14px 32px rgba(0,80,150,.18);margin-bottom:14px}.hero b{font-size:32px}.stButton>button,.stLinkButton>a{border-radius:14px!important;min-height:46px;font-weight:700}[data-testid="stImage"] img{border-radius:16px}h1,h2,h3{color:#125f9d}@media(max-width:768px){[data-testid="stMainBlockContainer"]{padding:.6rem .7rem 4rem}.hero{padding:18px}.hero b{font-size:27px}[data-testid="stHorizontalBlock"]{flex-wrap:wrap}[data-testid="column"]{min-width:min(100%,250px);flex:1 1 250px!important}}</style>''', unsafe_allow_html=True)
+    st.markdown('''<style>.stApp{background:linear-gradient(180deg,#f8fdff,#fff 45%,#f4fbff)}[data-testid="stMainBlockContainer"]{max-width:1180px;padding-top:1rem}.hero{padding:24px;border-radius:24px;background:linear-gradient(135deg,#1479d3,#55bde9);color:#fff;box-shadow:0 14px 32px rgba(0,80,150,.18);margin-bottom:14px}.hero b{font-size:32px}.stButton>button,.stLinkButton>a{border-radius:14px!important;min-height:46px;font-weight:700}[data-testid="stImage"] img{border-radius:16px}h1,h2,h3{color:#125f9d}@media(max-width:768px){[data-testid="stMainBlockContainer"]{padding:.6rem .7rem 4rem}.hero{padding:18px}.hero b{font-size:27px}[data-testid="stHorizontalBlock"]{flex-wrap:wrap}[data-testid="column"]{min-width:min(100%,250px);flex:1 1 250px!important}}
+.name-onboarding{max-width:760px;margin:2.2rem auto 1rem;padding:34px 28px;border-radius:28px;background:linear-gradient(135deg,#1479d3,#55bde9);color:#fff;box-shadow:0 18px 46px rgba(0,80,150,.22);text-align:center}
+.name-onboarding .title{font-size:34px;font-weight:900;line-height:1.25;margin-bottom:10px}
+.name-onboarding .sub{font-size:16px;font-weight:600;line-height:1.7;opacity:.98}
+.name-hint{max-width:760px;margin:0 auto 10px;text-align:center;color:#49677d;font-size:14px}
+@media(max-width:768px){.name-onboarding{margin:1rem auto .7rem;padding:27px 18px;border-radius:22px}.name-onboarding .title{font-size:27px}.name-onboarding .sub{font-size:14px}}</style>''', unsafe_allow_html=True)
 
 def usage_guide():
     with st.expander("📘 はじめての方へ｜アプリの使い方", expanded=not st.session_state.guide_seen):
@@ -595,20 +630,120 @@ def recommend(qs, purpose, area, season, kw):
 
 st.set_page_config(page_title="天草つながりクエスト", page_icon="🌊", layout="wide", initial_sidebar_state="collapsed")
 init_state(); apply_theme()
-st.markdown('<div class="hero"><b>🌊 天草つながりクエスト</b><br>天草をめぐって、見つけて、集める。あなたの旅をクエストにしよう。</div>', unsafe_allow_html=True)
 
 # URL ?pid=... を参加者IDに反映
 try:
     pid_q = st.query_params.get("pid", "")
-    if isinstance(pid_q, list): pid_q = pid_q[0] if pid_q else ""
-    if pid_q and not st.session_state.participant_id: st.session_state.participant_id = str(pid_q).strip()
-except Exception: pass
+    if isinstance(pid_q, list):
+        pid_q = pid_q[0] if pid_q else ""
+    if pid_q and not st.session_state.participant_id:
+        st.session_state.participant_id = str(pid_q).strip()
+except Exception:
+    pass
 
-if not st.session_state.data_loaded: load_user_data(); st.session_state.data_loaded = True
+# URLに参加者IDがある再訪者は、Supabaseから名前・進捗を先に読み込む
+if not st.session_state.data_loaded:
+    load_user_data()
+    st.session_state.data_loaded = True
 
-with st.expander("👤 ニックネーム・参加者情報"):
-    pid = st.text_input("参加者ID", value=st.session_state.participant_id); nick = st.text_input("ニックネーム", value=st.session_state.nickname)
-    if st.button("参加者情報を保存", use_container_width=True): st.session_state.participant_id = pid.strip(); st.session_state.nickname = nick.strip(); save_user_data(); st.success("保存しました。"); st.rerun()
+# ---------------------------------------------------------------------
+# ★ 初回大画面：参加者名の入力
+# 名前が未登録のときは、メインアプリを表示する前にこの画面だけを表示する。
+# ---------------------------------------------------------------------
+if not str(st.session_state.get("nickname", "")).strip():
+    st.markdown(
+        """
+        <div class="name-onboarding">
+          <div class="title">🌊 天草つながりクエストへようこそ！</div>
+          <div class="sub">
+            まず、今回このアプリを体験する<br>
+            <b>参加者のお名前</b>を教えてください。<br>
+            ニックネームでも大丈夫です。
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="name-hint">入力した名前は、あなたの旅の記録を管理するために使用します。</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("initial_participant_name_form"):
+        first_name = st.text_input(
+            "参加者のお名前（ニックネームでも可）",
+            placeholder="例：めい",
+            max_chars=30,
+        ).strip()
+
+        start_button = st.form_submit_button(
+            "この名前ではじめる 🚀",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if start_button:
+        if not first_name:
+            st.error("参加者のお名前を入力してください。")
+        else:
+            # URLにpidがない参加者には自動で一意の参加者IDを発行する。
+            if not str(st.session_state.get("participant_id", "")).strip():
+                st.session_state.participant_id = (
+                    "AMK-" + uuid.uuid4().hex[:10].upper()
+                )
+
+            st.session_state.nickname = first_name
+
+            # 自動発行した参加者IDをURLにも残し、再訪時に同じデータを読み込めるようにする。
+            try:
+                st.query_params["pid"] = st.session_state.participant_id
+            except Exception:
+                pass
+
+            save_user_data()
+            st.rerun()
+
+    # 名前入力が終わるまでは下のアプリ画面を表示しない。
+    st.stop()
+
+# ---------------------------------------------------------------------
+# 名前登録後のメイン画面
+# ---------------------------------------------------------------------
+st.markdown(
+    '<div class="hero"><b>🌊 天草つながりクエスト</b><br>'
+    '天草をめぐって、見つけて、集める。あなたの旅をクエストにしよう。</div>',
+    unsafe_allow_html=True,
+)
+
+st.success(
+    f"👋 {st.session_state.nickname} さん、天草の旅を楽しみましょう！"
+)
+
+with st.expander("👤 参加者名を変更する"):
+    new_nick = st.text_input(
+        "参加者のお名前（ニックネームでも可）",
+        value=st.session_state.nickname,
+        max_chars=30,
+        key="edit_participant_name",
+    ).strip()
+
+    st.caption(
+        f"参加者ID：{st.session_state.participant_id}"
+    )
+
+    if st.button(
+        "参加者名を保存",
+        use_container_width=True,
+        key="save_participant_name",
+    ):
+        if not new_nick:
+            st.warning("参加者のお名前を入力してください。")
+        else:
+            st.session_state.nickname = new_nick
+            save_user_data()
+            st.success("参加者名を変更しました。")
+            st.rerun()
 
 usage_guide(); render_clear_effect()
 

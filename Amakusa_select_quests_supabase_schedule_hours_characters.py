@@ -2083,11 +2083,6 @@ st.success(
     f"👋 {st.session_state.nickname} さん、天草の旅を楽しみましょう！"
 )
 
-st.caption(
-    "旅日記は、あとから「🔒 プライベート」または「🌍 全体公開」を選べます。"
-    "全体公開した写真は「みんなの足跡マップ」に表示されます。"
-)
-
 with st.expander("👤 参加者名を変更する"):
     new_nick = st.text_input(
         "参加者のお名前（ニックネームでも可）",
@@ -2134,12 +2129,6 @@ completed_for_end = [
 
 end_left, end_right = st.columns([2.2, 1])
 
-with end_left:
-    st.caption(
-        "写真を登録するとクエストCLEARできます。"
-        "GPSによるCLEAR判定はありません。"
-    )
-
 with end_right:
     if st.button(
         "🏁 クエスト終了・旅を振り返る",
@@ -2170,7 +2159,6 @@ with c2:
 
 # ログインボーナス直下にも、長いアンケートへ移動できるボタンを設置
 st.markdown("#### 📝 テストマーケティングアンケート")
-st.caption("旅のまとめ横にあるアンケートと同じ内容です。いつでもここから回答できます。")
 if st.button(
     "📝 アンケートに回答する",
     key="open_main_survey_button",

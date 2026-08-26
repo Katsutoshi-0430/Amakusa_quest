@@ -197,14 +197,14 @@ def get_quest(qid):
     return next((q for q in QUESTS + STORY_QUESTS if q["quest_id"] == qid), {})
 
 def init_state():
-    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, map_selected_qid="", nickname="")
+    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, map_selected_qid="", nickname="")
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
 def state_dict():
     return {
         "completed": list(st.session_state.completed), "completed_order": st.session_state.completed_order, "completed_at": st.session_state.completed_at,
-        "favorites": list(st.session_state.favorites), "notes": st.session_state.notes, "photos": st.session_state.photos, "sns_texts": st.session_state.sns_texts,
+        "favorites": list(st.session_state.favorites), "notes": st.session_state.notes, "photos": st.session_state.photos, "photo_storage_paths": st.session_state.photo_storage_paths, "diary_visibility": st.session_state.diary_visibility, "sns_texts": st.session_state.sns_texts,
         "diary": st.session_state.diary, "unlocked_character_ids": list(st.session_state.unlocked_character_ids), "unlocked_character_order": st.session_state.unlocked_character_order,
         "quest_character_rewards": st.session_state.quest_character_rewards, "apples": st.session_state.apples, "character_apples": st.session_state.character_apples,
         "last_login_date": st.session_state.last_login_date, "story_progress": st.session_state.story_progress, "profile_age": st.session_state.profile_age,
@@ -216,7 +216,7 @@ def apply_state(d):
     if not isinstance(d, dict): return
     for k, v in d.items():
         if k not in st.session_state: continue
-        if k in {"completed", "favorites", "unlocked_character_ids"}: v = set(v or [])
+        if k in {"completed", "favorites", "unlocked_character_ids", "photo_edit_open"}: v = set(v or [])
         st.session_state[k] = v
 
 def supabase_configured():
@@ -226,6 +226,494 @@ def supabase_configured():
 def get_supabase_client() -> Optional["Client"]:
     if not supabase_configured(): return None
     return create_client(safe_secret("SUPABASE_URL"), safe_secret("SUPABASE_SERVICE_ROLE_KEY") or safe_secret("SUPABASE_SECRET_KEY"))
+
+
+def diary_photo_bucket():
+    """
+    旅日記・クエスト写真用のSupabase Storage bucket名。
+    Streamlit Secrets に SUPABASE_DIARY_PHOTO_BUCKET を設定した場合はその名前を使う。
+    未設定時は diary-photos を使う。
+    """
+    return safe_secret("SUPABASE_DIARY_PHOTO_BUCKET", "diary-photos") or "diary-photos"
+
+def _photo_extension(uploaded_file):
+    suffix = Path(uploaded_file.name).suffix.lower().lstrip(".")
+    if suffix not in {"jpg", "jpeg", "png", "webp"}:
+        suffix = "jpg"
+    return suffix
+
+def upload_diary_photo_to_supabase(qid, uploaded_file):
+    """
+    アルバムから選んだ写真をSupabase Storageへ保存する。
+    変更時は新しい写真を先に保存し、成功後に古い写真を削除する。
+    戻り値: (成功したか, storage_path, エラーメッセージ)
+    """
+    if not supabase_configured():
+        return False, "", "Supabaseが設定されていません。"
+
+    pid = str(st.session_state.get("participant_id", "")).strip()
+    if not pid:
+        return False, "", "参加者IDがありません。"
+
+    sb = get_supabase_client()
+    if sb is None:
+        return False, "", "Supabaseに接続できません。"
+
+    ext = _photo_extension(uploaded_file)
+    safe_qid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(qid))
+    new_path = f"participants/{pid}/{safe_qid}/{uuid.uuid4().hex}.{ext}"
+
+    try:
+        file_options = {
+            "content-type": uploaded_file.type or "image/jpeg",
+            "cache-control": "3600",
+            "upsert": "false",
+        }
+
+        sb.storage.from_(diary_photo_bucket()).upload(
+            new_path,
+            uploaded_file.getvalue(),
+            file_options=file_options,
+        )
+
+        old_path = st.session_state.photo_storage_paths.get(qid, "")
+        if old_path and old_path != new_path:
+            try:
+                sb.storage.from_(diary_photo_bucket()).remove([old_path])
+            except Exception:
+                # 新しい写真の登録は成功しているため、
+                # 古いファイル削除だけ失敗しても利用者には影響させない。
+                pass
+
+        return True, new_path, ""
+
+    except Exception as e:
+        return False, "", str(e)
+
+def diary_photo_signed_url(qid, expires_in=3600):
+    """
+    private bucket の写真を表示するための一時URLを取得する。
+    """
+    storage_path = st.session_state.photo_storage_paths.get(qid, "")
+    if not storage_path or not supabase_configured():
+        return ""
+
+    try:
+        result = (
+            get_supabase_client()
+            .storage
+            .from_(diary_photo_bucket())
+            .create_signed_url(storage_path, expires_in)
+        )
+
+        if isinstance(result, dict):
+            return (
+                result.get("signedURL")
+                or result.get("signedUrl")
+                or result.get("signed_url")
+                or ""
+            )
+
+        return (
+            getattr(result, "signedURL", "")
+            or getattr(result, "signed_url", "")
+            or ""
+        )
+    except Exception:
+        return ""
+
+def registered_photo_source(qid):
+    """
+    今のセッションで選択した写真があればbytesを優先。
+    再訪時はSupabase Storageの署名付きURLを返す。
+    """
+    raw = st.session_state.photo_data.get(qid)
+    if raw:
+        return raw
+
+    signed_url = diary_photo_signed_url(qid)
+    if signed_url:
+        return signed_url
+
+    return ""
+
+
+def diary_photo_signed_url_from_path(storage_path, expires_in=3600):
+    """
+    private bucket 内の任意パスから署名付きURLを作る。
+    みんなの足跡マップでも使う。
+    """
+    if not storage_path or not supabase_configured():
+        return ""
+
+    try:
+        result = (
+            get_supabase_client()
+            .storage
+            .from_(diary_photo_bucket())
+            .create_signed_url(storage_path, expires_in)
+        )
+
+        if isinstance(result, dict):
+            return (
+                result.get("signedURL")
+                or result.get("signedUrl")
+                or result.get("signed_url")
+                or ""
+            )
+
+        return (
+            getattr(result, "signedURL", "")
+            or getattr(result, "signed_url", "")
+            or ""
+        )
+    except Exception:
+        return ""
+
+def public_diary_table():
+    """
+    みんなの足跡マップに使うSupabase table名。
+    Secrets未設定時は public_diary を利用。
+    """
+    return safe_secret("SUPABASE_PUBLIC_DIARY_TABLE", "public_diary") or "public_diary"
+
+def render_visibility_selector(qid, scope):
+    """
+    旅日記の公開範囲を選ぶUI。
+    defaultは private。
+    """
+    current = st.session_state.diary_visibility.get(qid, "private")
+    options = [
+        "🔒 プライベート（自分だけ）",
+        "🌍 全体公開（みんなの足跡に表示）",
+    ]
+
+    index = 1 if current == "public" else 0
+    label = st.radio(
+        "旅日記の公開範囲",
+        options,
+        index=index,
+        horizontal=True,
+        key=f"{scope}_visibility_{qid}",
+    )
+
+    visibility = "public" if label.startswith("🌍") else "private"
+    st.session_state.diary_visibility[qid] = visibility
+
+    if visibility == "public":
+        st.info(
+            "全体公開にすると、"
+            "ニックネーム・写真・感想が"
+            "「みんなの足跡マップ」に表示されます。"
+            "位置は現在地ではなく、このクエスト場所の固定ピンで表示されます。"
+        )
+    else:
+        st.caption(
+            "プライベートは自分だけが見られます。"
+            "他の参加者には表示されません。"
+        )
+
+    return visibility
+
+def save_public_diary_entry(qid):
+    """
+    diary_visibility に応じて public_diary テーブルを同期する。
+    public の場合は upsert、private の場合は削除。
+    """
+    pid = str(st.session_state.get("participant_id", "")).strip()
+    visibility = st.session_state.diary_visibility.get(qid, "private")
+
+    if not pid or not supabase_configured():
+        return False, "Supabaseが設定されていません。"
+
+    sb = get_supabase_client()
+    if sb is None:
+        return False, "Supabaseに接続できません。"
+
+    table = public_diary_table()
+
+    try:
+        if visibility != "public":
+            try:
+                sb.table(table).delete().eq("participant_id", pid).eq("quest_id", qid).execute()
+            except Exception:
+                # もともと行がなくても問題なし
+                pass
+            return True, "旅日記をプライベートに設定しました。"
+
+        if qid not in st.session_state.completed:
+            return False, "クエストをクリアすると全体公開できます。"
+
+        photo_storage_path = st.session_state.photo_storage_paths.get(qid, "")
+        if not photo_storage_path:
+            return False, (
+                "全体公開するには、写真がSupabase Storageに保存されている必要があります。"
+                "写真を登録または変更し直してください。"
+            )
+
+        q = get_quest(qid)
+        row = {
+            "participant_id": pid,
+            "quest_id": qid,
+            "nickname": st.session_state.get("nickname", "") or "参加者",
+            "linked_name": q.get("linked_name", ""),
+            "quest_name": q.get("quest_name", ""),
+            "area": classified_area(q),
+            "note": st.session_state.notes.get(qid, ""),
+            "photo_storage_path": photo_storage_path,
+            "visibility": "public",
+            "completed_at": st.session_state.completed_at.get(qid),
+            "updated_at": jp_now().isoformat(),
+        }
+
+        existing = (
+            sb.table(table)
+            .select("*")
+            .eq("participant_id", pid)
+            .eq("quest_id", qid)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        if existing:
+            (
+                sb.table(table)
+                .update(row)
+                .eq("participant_id", pid)
+                .eq("quest_id", qid)
+                .execute()
+            )
+        else:
+            sb.table(table).insert(row).execute()
+
+        return True, "旅日記を全体公開しました。"
+
+    except Exception as e:
+        return False, str(e)
+
+def load_public_diary_rows():
+    """
+    みんなの足跡用の公開旅日記を取得する。
+    """
+    if not supabase_configured():
+        return [], "Supabaseが設定されていません。"
+
+    sb = get_supabase_client()
+    if sb is None:
+        return [], "Supabaseに接続できません。"
+
+    try:
+        rows = (
+            sb.table(public_diary_table())
+            .select("*")
+            .eq("visibility", "public")
+            .order("updated_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+
+        normalized = []
+        for r in rows:
+            qid = str(r.get("quest_id", "")).strip()
+            q = get_quest(qid)
+            if not q:
+                continue
+
+            item = dict(r)
+            item["linked_name"] = item.get("linked_name") or q.get("linked_name", "")
+            item["quest_name"] = item.get("quest_name") or q.get("quest_name", "")
+            item["area"] = item.get("area") or classified_area(q)
+            item["photo_url"] = diary_photo_signed_url_from_path(item.get("photo_storage_path", ""))
+            normalized.append(item)
+
+        return normalized, ""
+
+    except Exception as e:
+        return [], str(e)
+
+def public_diary_popup_html(row):
+    """
+    公開旅日記マーカー用のPopup HTML
+    """
+    nickname = html.escape(str(row.get("nickname", "参加者")))
+    linked_name = html.escape(str(row.get("linked_name", "")))
+    note = html.escape(str(row.get("note", "") or "感想はまだありません。")).replace("\n", "<br>")
+    area = html.escape(str(row.get("area", "")))
+    date_text = html.escape(str(row.get("completed_at", "") or "")[:10])
+    photo_url = row.get("photo_url", "")
+
+    image_html = ""
+    if photo_url:
+        image_html = (
+            f'<img src="{photo_url}" '
+            'style="width:100%;max-width:220px;border-radius:12px;margin:8px 0;">'
+        )
+
+    return f"""
+    <div style="width:240px;font-family:sans-serif;">
+      <div style="font-weight:800;color:#125f9d;">{nickname} さん</div>
+      <div style="font-size:13px;color:#576c80;margin:2px 0 4px;">{date_text} / {area}</div>
+      <div style="font-weight:700;">📍 {linked_name}</div>
+      {image_html}
+      <div style="font-size:13px;line-height:1.6;">{note}</div>
+    </div>
+    """
+
+def save_selected_photo(qid, uploaded_file):
+    """
+    選択した写真を登録する。
+    Supabase Storageに保存できる場合は永続保存。
+    ローカル開発時はsession_stateにも保持する。
+    戻り値: (永続保存できたか, メッセージ)
+    """
+    raw = uploaded_file.getvalue()
+
+    # まず現在のセッションで表示・クリア判定できるように保存
+    st.session_state.photos[qid] = uploaded_file.name
+    st.session_state.photo_data[qid] = raw
+    st.session_state.photo_mime[qid] = uploaded_file.type or "image/jpeg"
+
+    persistent = False
+    message = ""
+
+    if supabase_configured():
+        ok, storage_path, error = upload_diary_photo_to_supabase(qid, uploaded_file)
+        if ok:
+            st.session_state.photo_storage_paths[qid] = storage_path
+            persistent = True
+            message = "写真を登録しました。後から変更できます。"
+        else:
+            message = (
+                "写真はこのセッションには登録できましたが、"
+                "Supabase Storageへの保存に失敗しました。"
+                "Storageに「diary-photos」bucketを作成しているか確認してください。"
+                f" エラー: {error}"
+            )
+    else:
+        message = (
+            "写真を登録しました。"
+            "Supabase未設定のため、ローカル開発では再起動後に写真本体が消える場合があります。"
+        )
+
+    save_user_data()
+    try:
+        save_quest_supabase(qid)
+    except Exception:
+        pass
+
+    # すでにクリア済みで全体公開設定なら、写真差し替えを公開側にも反映
+    if qid in st.session_state.completed:
+        try:
+            save_public_diary_entry(qid)
+        except Exception:
+            pass
+
+    return persistent, message
+
+def render_registered_photo_editor(qid, scope):
+    """
+    写真の新規登録・変更UI。
+    スマホでは file_uploader から写真ライブラリ / アルバムを選択できる。
+    戻り値: 写真が登録済みか
+    """
+    existing = bool(
+        st.session_state.photos.get(qid)
+        or st.session_state.photo_storage_paths.get(qid)
+    )
+
+    # 登録済み写真を表示
+    if existing:
+        st.markdown("**📷 登録済みの写真**")
+        src = registered_photo_source(qid)
+
+        if src:
+            st.image(
+                src,
+                caption="現在登録されている写真",
+                use_container_width=True,
+            )
+        else:
+            st.success("📷 写真は登録済みです。")
+
+        if qid not in st.session_state.photo_edit_open:
+            if st.button(
+                "🔄 写真を変更する",
+                key=f"{scope}_open_photo_edit_{qid}",
+                use_container_width=True,
+            ):
+                st.session_state.photo_edit_open.add(qid)
+                st.rerun()
+
+    editing = (
+        (not existing)
+        or qid in st.session_state.photo_edit_open
+    )
+
+    if editing:
+        if existing:
+            st.info(
+                "新しい写真を選択して「この写真に変更する」を押すと、"
+                "現在の写真と入れ替わります。"
+            )
+        else:
+            st.info(
+                "スマホでは「アルバム・写真ライブラリ」から"
+                "すでに撮影した写真を選択できます。"
+            )
+
+        upload = st.file_uploader(
+            "🖼️ アルバムから写真を選択",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=False,
+            key=f"{scope}_album_photo_{qid}",
+            help="スマホの写真ライブラリ・アルバム、または端末内の画像ファイルから選択できます。",
+        )
+
+        if upload is not None:
+            st.image(
+                upload.getvalue(),
+                caption="選択中の写真（まだ登録されていません）",
+                use_container_width=True,
+            )
+
+            button_label = (
+                "✅ この写真に変更する"
+                if existing
+                else "✅ この写真を登録する"
+            )
+
+            if st.button(
+                button_label,
+                key=f"{scope}_save_photo_{qid}",
+                type="primary",
+                use_container_width=True,
+            ):
+                persistent, message = save_selected_photo(qid, upload)
+
+                if qid in st.session_state.photo_edit_open:
+                    st.session_state.photo_edit_open.discard(qid)
+
+                if persistent or not supabase_configured():
+                    st.success(message)
+                else:
+                    st.warning(message)
+
+                st.rerun()
+
+        if existing:
+            if st.button(
+                "キャンセル",
+                key=f"{scope}_cancel_photo_edit_{qid}",
+                use_container_width=True,
+            ):
+                st.session_state.photo_edit_open.discard(qid)
+                st.rerun()
+
+    return existing
+
 
 def upsert_progress(row):
     sb = get_supabase_client()
@@ -244,7 +732,7 @@ def save_app_state_supabase():
 def save_quest_supabase(qid):
     pid = st.session_state.participant_id.strip()
     if not pid or not supabase_configured(): return False
-    return upsert_progress({"participant_id": pid, "quest_id": qid, "completed": qid in st.session_state.completed, "completed_at": st.session_state.completed_at.get(qid), "favorite": qid in st.session_state.favorites, "note": st.session_state.notes.get(qid, ""), "photo_uploaded": bool(st.session_state.photos.get(qid)), "sns_text": st.session_state.sns_texts.get(qid, ""), "x_post_url": "", "character_id": st.session_state.quest_character_rewards.get(qid, "")})
+    return upsert_progress({"participant_id": pid, "quest_id": qid, "completed": qid in st.session_state.completed, "completed_at": st.session_state.completed_at.get(qid), "favorite": qid in st.session_state.favorites, "note": st.session_state.notes.get(qid, ""), "photo_uploaded": bool(st.session_state.photos.get(qid) or st.session_state.photo_storage_paths.get(qid)), "sns_text": st.session_state.sns_texts.get(qid, ""), "x_post_url": "", "character_id": st.session_state.quest_character_rewards.get(qid, "")})
 
 def save_survey_to_quest_progress(payload):
     pid = st.session_state.participant_id.strip()
@@ -407,8 +895,16 @@ def complete_quest(q):
     st.session_state.clear_effect_counter += 1
     st.session_state.clear_effect = {"id": st.session_state.clear_effect_counter, "qid": qid, "new": new, "apples": 0 if already else 3}
     save_user_data()
-    try: save_quest_supabase(qid)
-    except Exception: pass
+    try:
+        save_quest_supabase(qid)
+    except Exception:
+        pass
+
+    # クリア時点で全体公開が選ばれていれば、みんなの足跡にも同期
+    try:
+        save_public_diary_entry(qid)
+    except Exception:
+        pass
 
 def render_clear_effect():
     e = st.session_state.clear_effect
@@ -442,21 +938,41 @@ def quest_card(q, scope):
         c2.link_button("Googleマップ", google_maps_url(original), use_container_width=True)
         note = st.text_area("旅のメモ・感想", value=st.session_state.notes.get(qid, ""), key=f"{scope}_note_{qid}")
         st.session_state.notes[qid] = note
-        upload = st.file_uploader("クエスト達成用の写真を添付", type=["jpg", "jpeg", "png", "webp"], key=f"{scope}_photo_{qid}")
-        if upload:
-            st.session_state.photos[qid] = upload.name; st.session_state.photo_data[qid] = upload.getvalue(); st.session_state.photo_mime[qid] = upload.type or "image/jpeg"; st.image(upload.getvalue(), use_container_width=True)
-        elif st.session_state.photos.get(qid): st.success("📷 写真添付済み")
+        st.markdown("#### 📷 クエスト・旅日記の写真")
+        render_registered_photo_editor(qid, scope)
+
+        st.markdown("#### 🌍 公開設定")
+        render_visibility_selector(qid, scope)
+
         gps_ok = True
         if st.session_state.gps_required:
             gps_ok = d is not None and d <= st.session_state.gps_radius_m
             if gps_ok: st.success(f"📍 GPS判定OK：{fmt_dist(d)}")
             elif d is None: st.warning("現在地を取得してください。")
             else: st.warning(f"達成範囲外です。現在：{fmt_dist(d)} / 判定半径：{st.session_state.gps_radius_m}m")
-        photo_ok = bool(st.session_state.photos.get(qid))
+        photo_ok = bool(st.session_state.photos.get(qid) or st.session_state.photo_storage_paths.get(qid))
         if not photo_ok: st.info("クリアには写真添付が必要です。")
         if st.button("もう一度クリア演出を見る" if done else "🎉 クエストをクリアする", key=f"{scope}_clear_{qid}", type="primary", disabled=not(gps_ok and photo_ok), use_container_width=True): complete_quest(original); st.rerun()
         if done:
-            text = st.text_area("SNS投稿用文章", value=st.session_state.sns_texts.get(qid, make_sns_text(original)), key=f"{scope}_sns_{qid}"); st.session_state.sns_texts[qid] = text
+            if st.button(
+                "💾 旅日記・公開設定を保存",
+                key=f"{scope}_save_diary_visibility_{qid}",
+                use_container_width=True,
+            ):
+                save_user_data()
+                try:
+                    save_quest_supabase(qid)
+                except Exception:
+                    pass
+
+                ok, msg = save_public_diary_entry(qid)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.warning(msg)
+
+            text = st.text_area("SNS投稿用文章", value=st.session_state.sns_texts.get(qid, make_sns_text(original)), key=f"{scope}_sns_{qid}")
+            st.session_state.sns_texts[qid] = text
             st.link_button("Xで共有", x_url(text), use_container_width=True)
 
 # =====================================================================
@@ -475,23 +991,156 @@ def render_map(qs):
         folium.Marker(c, tooltip=d["linked_name"], popup=folium.Popup(f"<b>{html.escape(d['linked_name'])}</b><br>{html.escape(d['quest_name'])}", max_width=280), icon=folium.Icon(color=color, icon="flag")).add_to(m)
     st_folium(m, width=None, height=500, key="main_quest_map")
 
-def render_diary():
-    st.subheader("👣 足跡マップ・旅日記")
-    done = [qid for qid in st.session_state.completed_order if qid in st.session_state.completed]
+def render_private_diary():
+    st.subheader("🔒 自分の旅日記")
+
+    done = [
+        qid
+        for qid in st.session_state.completed_order
+        if qid in st.session_state.completed
+    ]
+
     if folium is not None and st_folium is not None:
         m = folium.Map(location=[32.43, 130.19], zoom_start=9)
         for i, qid in enumerate(done, 1):
-            q, c = get_quest(qid), QUEST_COORDS.get(qid)
-            if c: folium.Marker(c, tooltip=f"{i}. {q['linked_name']}", icon=folium.Icon(color="green", icon="check")).add_to(m)
+            q = get_quest(qid)
+            c = QUEST_COORDS.get(qid)
+            if c:
+                folium.Marker(
+                    c,
+                    tooltip=f"{i}. {q['linked_name']}",
+                    icon=folium.Icon(color="green", icon="check"),
+                ).add_to(m)
         st_folium(m, width=None, height=450, key="diary_map")
-    if not done: st.info("まだ足跡はありません。クエストをクリアすると表示されます。"); return
+
+    if not done:
+        st.info("まだ足跡はありません。クエストをクリアすると表示されます。")
+        return
+
     for qid in reversed(done):
         q = get_quest(qid)
         with st.container(border=True):
-            st.markdown(f"**{q['linked_name']}**"); st.caption(st.session_state.completed_at.get(qid, "")[:10]); n = st.text_area("感想", value=st.session_state.notes.get(qid, ""), key=f"diary_{qid}")
-            if st.button("日記を保存", key=f"diary_save_{qid}", use_container_width=True): st.session_state.notes[qid] = n; save_user_data(); st.success("保存しました。")
+            st.markdown(f"**{q['linked_name']}**")
+            st.caption(st.session_state.completed_at.get(qid, "")[:10])
+
+            render_registered_photo_editor(
+                qid,
+                scope=f"diary_photo_{qid}",
+            )
+
+            st.markdown("#### 🌍 公開設定")
+            render_visibility_selector(qid, f"diary_visibility_{qid}")
+
+            n = st.text_area(
+                "感想",
+                value=st.session_state.notes.get(qid, ""),
+                key=f"diary_{qid}",
+            )
+
+            if st.button(
+                "日記・公開設定を保存",
+                key=f"diary_save_{qid}",
+                use_container_width=True,
+            ):
+                st.session_state.notes[qid] = n
+                save_user_data()
+
+                try:
+                    save_quest_supabase(qid)
+                except Exception:
+                    pass
+
+                ok, msg = save_public_diary_entry(qid)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.warning(msg)
+
+def render_public_diary():
+    st.subheader("🌍 みんなの足跡マップ")
+    st.caption(
+        "ここには、参加者が「全体公開」を選んだ旅日記だけが表示されます。"
+        "位置はクエスト地点の固定座標です。"
+    )
+
+    rows, err = load_public_diary_rows()
+
+    if err:
+        st.warning(
+            "公開旅日記を読み込めませんでした。"
+            "Supabaseに public_diary テーブルがあるか確認してください。"
+            f" エラー: {err}"
+        )
+        return
+
+    if not rows:
+        st.info(
+            "まだ公開された旅日記はありません。"
+            "自分の旅日記で「🌍 全体公開」を選ぶと、ここに表示されます。"
+        )
+        return
+
+    if folium is not None and st_folium is not None:
+        m = folium.Map(location=[32.43, 130.19], zoom_start=9)
+
+        for row in rows:
+            qid = row.get("quest_id", "")
+            coord = QUEST_COORDS.get(qid)
+            if not coord:
+                continue
+
+            folium.Marker(
+                coord,
+                tooltip=f"{row.get('nickname', '参加者')} さん / {row.get('linked_name', '')}",
+                popup=folium.Popup(
+                    public_diary_popup_html(row),
+                    max_width=290,
+                ),
+                icon=folium.Icon(color="blue", icon="camera"),
+            ).add_to(m)
+
+        st_folium(
+            m,
+            width=None,
+            height=500,
+            key="public_diary_map",
+        )
+
+    st.markdown("### 🧳 公開されている旅日記一覧")
+
+    for row in rows:
+        with st.container(border=True):
+            st.markdown(
+                f"**{row.get('nickname', '参加者')} さん** "
+                f"｜ 📍 {row.get('linked_name', '')}"
+            )
+            st.caption(
+                f"{str(row.get('completed_at', '') or '')[:10]} / "
+                f"{row.get('area', '')}"
+            )
+
+            if row.get("photo_url"):
+                st.image(
+                    row["photo_url"],
+                    use_container_width=True,
+                )
+
+            note = row.get("note", "") or "感想はまだありません。"
+            st.write(note)
+
+def render_diary():
+    my_tab, public_tab = st.tabs(
+        ["🔒 自分の旅日記", "🌍 みんなの足跡"]
+    )
+
+    with my_tab:
+        render_private_diary()
+
+    with public_tab:
+        render_public_diary()
 
 def render_character(char, locked=False):
+
     with st.container(border=True):
         if locked: st.markdown("# ❓"); st.markdown("**？？？**"); st.caption("対応するクエストをクリアすると解放されます。"); return
         img = character_image_path(char["img_id"])
@@ -612,7 +1261,7 @@ def apply_theme():
 
 def usage_guide():
     with st.expander("📘 はじめての方へ｜アプリの使い方", expanded=not st.session_state.guide_seen):
-        st.markdown("**① クエストを選ぶ** → **② 現地でGPS・写真判定** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記を残す** → **⑥ 最後にアンケート回答**")
+        st.markdown("**① クエストを選ぶ** → **② 現地でGPS・写真判定** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記は「🔒 プライベート / 🌍 全体公開」を選べる** → **⑥ 全体公開を選ぶと「みんなの足跡」に表示** → **⑦ 最後にアンケート回答**")
         if not st.session_state.guide_seen and st.button("✅ 使い方を確認しました", use_container_width=True): st.session_state.guide_seen = True; save_user_data(); st.rerun()
 
 def recommend(qs, purpose, area, season, kw):
@@ -718,6 +1367,11 @@ st.markdown(
 
 st.success(
     f"👋 {st.session_state.nickname} さん、天草の旅を楽しみましょう！"
+)
+
+st.caption(
+    "旅日記は、あとから「🔒 プライベート」または「🌍 全体公開」を選べます。"
+    "全体公開した写真は「みんなの足跡マップ」に表示されます。"
 )
 
 with st.expander("👤 参加者名を変更する"):

@@ -43,6 +43,7 @@ STORY_ASSET_DIR = BASE_DIR / "story_assets"
 IMG_EXTS = ["jpg", "jpeg", "png", "webp", "JPG", "JPEG", "PNG", "WEBP"]
 APP_STATE_QUEST_ID = "__app_state__"
 SURVEY_QUEST_ID = "__survey__"
+PUBLIC_DIARY_PREFIX = "__public_diary__::"
 
 AGE_OPTIONS = ["選択してください", "10代", "20代", "30代", "40代", "50代", "60代", "70代以上"]
 FEATURE_SURVEY_ITEMS = [
@@ -236,16 +237,89 @@ def diary_photo_bucket():
     """
     return safe_secret("SUPABASE_DIARY_PHOTO_BUCKET", "diary-photos") or "diary-photos"
 
-def _photo_extension(uploaded_file):
-    suffix = Path(uploaded_file.name).suffix.lower().lstrip(".")
+
+def ensure_diary_photo_bucket():
+    """
+    diary-photos bucket が無い場合、Service Role Key を使って自動作成を試みる。
+    既に存在する場合はそのまま利用する。
+    戻り値: (成功したか, エラーメッセージ)
+    """
+    if not supabase_configured():
+        return False, "Supabaseが設定されていません。"
+
+    sb = get_supabase_client()
+    if sb is None:
+        return False, "Supabaseに接続できません。"
+
+    bucket_name = diary_photo_bucket()
+
+    try:
+        buckets = sb.storage.list_buckets()
+        existing_names = set()
+
+        for b in buckets or []:
+            if isinstance(b, dict):
+                name = b.get("name") or b.get("id")
+            else:
+                name = getattr(b, "name", None) or getattr(b, "id", None)
+            if name:
+                existing_names.add(str(name))
+
+        if bucket_name in existing_names:
+            return True, ""
+
+        # supabase-py のバージョン差を吸収して作成
+        try:
+            sb.storage.create_bucket(
+                bucket_name,
+                options={
+                    "public": False,
+                    "file_size_limit": 15 * 1024 * 1024,
+                    "allowed_mime_types": [
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                    ],
+                },
+            )
+        except TypeError:
+            sb.storage.create_bucket(
+                bucket_name,
+                {
+                    "public": False,
+                    "file_size_limit": 15 * 1024 * 1024,
+                    "allowed_mime_types": [
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                    ],
+                },
+            )
+
+        return True, ""
+
+    except Exception as e:
+        # 「すでに存在する」系は成功扱い
+        msg = str(e)
+        if "already" in msg.lower() or "exists" in msg.lower() or "duplicate" in msg.lower():
+            return True, ""
+        return False, msg
+
+
+def _photo_extension_from_name(filename):
+    suffix = Path(str(filename or "")).suffix.lower().lstrip(".")
     if suffix not in {"jpg", "jpeg", "png", "webp"}:
         suffix = "jpg"
     return suffix
 
-def upload_diary_photo_to_supabase(qid, uploaded_file):
+
+def _photo_extension(uploaded_file):
+    return _photo_extension_from_name(getattr(uploaded_file, "name", ""))
+
+
+def upload_photo_bytes_to_supabase(qid, raw, filename="photo.jpg", mime="image/jpeg"):
     """
-    アルバムから選んだ写真をSupabase Storageへ保存する。
-    変更時は新しい写真を先に保存し、成功後に古い写真を削除する。
+    画像bytesをSupabase Storageへ永続保存する共通処理。
     戻り値: (成功したか, storage_path, エラーメッセージ)
     """
     if not supabase_configured():
@@ -259,36 +333,104 @@ def upload_diary_photo_to_supabase(qid, uploaded_file):
     if sb is None:
         return False, "", "Supabaseに接続できません。"
 
-    ext = _photo_extension(uploaded_file)
+    bucket_ok, bucket_error = ensure_diary_photo_bucket()
+    if not bucket_ok:
+        return False, "", (
+            "写真保存用Storageを準備できませんでした。"
+            f" 詳細: {bucket_error}"
+        )
+
+    ext = _photo_extension_from_name(filename)
     safe_qid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(qid))
     new_path = f"participants/{pid}/{safe_qid}/{uuid.uuid4().hex}.{ext}"
 
     try:
         file_options = {
-            "content-type": uploaded_file.type or "image/jpeg",
+            "content-type": mime or "image/jpeg",
             "cache-control": "3600",
             "upsert": "false",
         }
 
-        sb.storage.from_(diary_photo_bucket()).upload(
-            new_path,
-            uploaded_file.getvalue(),
-            file_options=file_options,
-        )
+        try:
+            sb.storage.from_(diary_photo_bucket()).upload(
+                new_path,
+                raw,
+                file_options=file_options,
+            )
+        except TypeError:
+            # supabase-py のバージョン差対策
+            sb.storage.from_(diary_photo_bucket()).upload(
+                new_path,
+                raw,
+                file_options,
+            )
 
         old_path = st.session_state.photo_storage_paths.get(qid, "")
         if old_path and old_path != new_path:
             try:
                 sb.storage.from_(diary_photo_bucket()).remove([old_path])
             except Exception:
-                # 新しい写真の登録は成功しているため、
-                # 古いファイル削除だけ失敗しても利用者には影響させない。
                 pass
 
         return True, new_path, ""
 
     except Exception as e:
         return False, "", str(e)
+
+
+def upload_diary_photo_to_supabase(qid, uploaded_file):
+    """
+    アルバムから選んだ写真をSupabase Storageへ保存する。
+    変更時は新しい写真を先に保存し、成功後に古い写真を削除する。
+    戻り値: (成功したか, storage_path, エラーメッセージ)
+    """
+    return upload_photo_bytes_to_supabase(
+        qid=qid,
+        raw=uploaded_file.getvalue(),
+        filename=getattr(uploaded_file, "name", "photo.jpg"),
+        mime=getattr(uploaded_file, "type", None) or "image/jpeg",
+    )
+
+
+def ensure_photo_in_storage(qid):
+    """
+    公開時にStorageパスが無い場合でも、
+    現在セッションに写真bytesが残っていれば自動アップロードして復旧する。
+    戻り値: (成功したか, storage_path, エラーメッセージ)
+    """
+    current_path = st.session_state.photo_storage_paths.get(qid, "")
+    if current_path:
+        return True, current_path, ""
+
+    raw = st.session_state.photo_data.get(qid)
+    if not raw:
+        return False, "", (
+            "公開用の写真データが見つかりません。"
+            "「写真を変更する」から写真を選び直して保存してください。"
+        )
+
+    filename = st.session_state.photos.get(qid) or f"{qid}.jpg"
+    mime = st.session_state.photo_mime.get(qid) or "image/jpeg"
+
+    ok, storage_path, error = upload_photo_bytes_to_supabase(
+        qid=qid,
+        raw=raw,
+        filename=filename,
+        mime=mime,
+    )
+    if ok:
+        st.session_state.photo_storage_paths[qid] = storage_path
+        try:
+            save_user_data()
+        except Exception:
+            pass
+        try:
+            save_quest_supabase(qid)
+        except Exception:
+            pass
+
+    return ok, storage_path, error
+
 
 def diary_photo_signed_url(qid, expires_in=3600):
     """
@@ -370,12 +512,13 @@ def diary_photo_signed_url_from_path(storage_path, expires_in=3600):
     except Exception:
         return ""
 
-def public_diary_table():
+def public_diary_progress_id(qid):
     """
-    みんなの足跡マップに使うSupabase table名。
-    Secrets未設定時は public_diary を利用。
+    公開旅日記を既存の quest_progress テーブルに保存するための特別ID。
+    新しいDBテーブルを作らずに運用できる。
     """
-    return safe_secret("SUPABASE_PUBLIC_DIARY_TABLE", "public_diary") or "public_diary"
+    return f"{PUBLIC_DIARY_PREFIX}{qid}"
+
 
 def render_visibility_selector(qid, scope):
     """
@@ -402,10 +545,10 @@ def render_visibility_selector(qid, scope):
 
     if visibility == "public":
         st.info(
-            "全体公開にすると、"
-            "ニックネーム・写真・感想が"
-            "「みんなの足跡マップ」に表示されます。"
-            "位置は現在地ではなく、このクエスト場所の固定ピンで表示されます。"
+            "全体公開すると、ニックネーム・写真・感想が"
+            "「みんなの足跡」に表示されます。"
+            "現在地は公開されず、クエスト場所の固定ピンだけが表示されます。"
+            "人物や車のナンバーなど、公開したくないものが写っていないか確認してください。"
         )
     else:
         st.caption(
@@ -415,44 +558,54 @@ def render_visibility_selector(qid, scope):
 
     return visibility
 
+
 def save_public_diary_entry(qid):
     """
-    diary_visibility に応じて public_diary テーブルを同期する。
-    public の場合は upsert、private の場合は削除。
+    公開旅日記を既存の quest_progress テーブルへ同期する。
+    - public: __public_diary__::<quest_id> という特別行を作成/更新
+    - private: その特別行を削除
+    これにより public_diary 専用テーブルは不要。
     """
     pid = str(st.session_state.get("participant_id", "")).strip()
     visibility = st.session_state.diary_visibility.get(qid, "private")
 
     if not pid or not supabase_configured():
-        return False, "Supabaseが設定されていません。"
+        return False, "公開機能を利用するための接続設定を確認してください。"
 
     sb = get_supabase_client()
     if sb is None:
-        return False, "Supabaseに接続できません。"
+        return False, "公開機能に接続できませんでした。もう一度お試しください。"
 
-    table = public_diary_table()
+    public_qid = public_diary_progress_id(qid)
 
     try:
         if visibility != "public":
             try:
-                sb.table(table).delete().eq("participant_id", pid).eq("quest_id", qid).execute()
+                (
+                    sb.table("quest_progress")
+                    .delete()
+                    .eq("participant_id", pid)
+                    .eq("quest_id", public_qid)
+                    .execute()
+                )
             except Exception:
-                # もともと行がなくても問題なし
                 pass
             return True, "旅日記をプライベートに設定しました。"
 
         if qid not in st.session_state.completed:
             return False, "クエストをクリアすると全体公開できます。"
 
-        photo_storage_path = st.session_state.photo_storage_paths.get(qid, "")
-        if not photo_storage_path:
+        # Storageパスが無い場合でも、セッション内の写真から自動復旧を試みる
+        photo_ok, photo_storage_path, photo_error = ensure_photo_in_storage(qid)
+        if not photo_ok:
             return False, (
-                "全体公開するには、写真がSupabase Storageに保存されている必要があります。"
-                "写真を登録または変更し直してください。"
+                "写真を公開用に保存できませんでした。"
+                "「写真を変更する」から写真を選び直して、もう一度保存してください。"
+                + (f"（{photo_error}）" if photo_error else "")
             )
 
         q = get_quest(qid)
-        row = {
+        payload = {
             "participant_id": pid,
             "quest_id": qid,
             "nickname": st.session_state.get("nickname", "") or "参加者",
@@ -466,36 +619,31 @@ def save_public_diary_entry(qid):
             "updated_at": jp_now().isoformat(),
         }
 
-        existing = (
-            sb.table(table)
-            .select("*")
-            .eq("participant_id", pid)
-            .eq("quest_id", qid)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        row = {
+            "participant_id": pid,
+            "quest_id": public_qid,
+            "completed": True,
+            "completed_at": payload["updated_at"],
+            "favorite": False,
+            "note": json.dumps(payload, ensure_ascii=False),
+            "photo_uploaded": True,
+            "sns_text": "",
+            "x_post_url": "",
+            "character_id": "",
+        }
 
-        if existing:
-            (
-                sb.table(table)
-                .update(row)
-                .eq("participant_id", pid)
-                .eq("quest_id", qid)
-                .execute()
-            )
-        else:
-            sb.table(table).insert(row).execute()
-
-        return True, "旅日記を全体公開しました。"
+        upsert_progress(row)
+        return True, "公開しました！「みんなの足跡」から確認できます。"
 
     except Exception as e:
-        return False, str(e)
+        return False, f"公開の保存に失敗しました。もう一度お試しください。（{e}）"
+
 
 def load_public_diary_rows():
     """
-    みんなの足跡用の公開旅日記を取得する。
+    全参加者の公開旅日記を既存の quest_progress テーブルから取得する。
+    Service Role Keyでサーバー側から読み込むため、
+    他の参加者が公開した写真・感想も表示できる。
     """
     if not supabase_configured():
         return [], "Supabaseが設定されていません。"
@@ -505,34 +653,64 @@ def load_public_diary_rows():
         return [], "Supabaseに接続できません。"
 
     try:
-        rows = (
-            sb.table(public_diary_table())
-            .select("*")
-            .eq("visibility", "public")
-            .order("updated_at", desc=True)
-            .execute()
-            .data
-            or []
-        )
+        try:
+            rows = (
+                sb.table("quest_progress")
+                .select("*")
+                .like("quest_id", f"{PUBLIC_DIARY_PREFIX}%")
+                .order("completed_at", desc=True)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            # SDKバージョン差などで like が使えない場合の安全なフォールバック
+            all_rows = (
+                sb.table("quest_progress")
+                .select("*")
+                .order("completed_at", desc=True)
+                .execute()
+                .data
+                or []
+            )
+            rows = [
+                r for r in all_rows
+                if str(r.get("quest_id", "")).startswith(PUBLIC_DIARY_PREFIX)
+            ]
 
         normalized = []
+
         for r in rows:
-            qid = str(r.get("quest_id", "")).strip()
+            try:
+                payload = json.loads(r.get("note") or "{}")
+            except Exception:
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("visibility") != "public":
+                continue
+
+            qid = str(payload.get("quest_id", "")).strip()
             q = get_quest(qid)
             if not q:
                 continue
 
-            item = dict(r)
+            item = dict(payload)
+            item["participant_id"] = item.get("participant_id") or r.get("participant_id")
             item["linked_name"] = item.get("linked_name") or q.get("linked_name", "")
             item["quest_name"] = item.get("quest_name") or q.get("quest_name", "")
             item["area"] = item.get("area") or classified_area(q)
-            item["photo_url"] = diary_photo_signed_url_from_path(item.get("photo_storage_path", ""))
+            item["photo_url"] = diary_photo_signed_url_from_path(
+                item.get("photo_storage_path", "")
+            )
             normalized.append(item)
 
         return normalized, ""
 
     except Exception as e:
         return [], str(e)
+
 
 def public_diary_popup_html(row):
     """
@@ -587,10 +765,9 @@ def save_selected_photo(qid, uploaded_file):
             message = "写真を登録しました。後から変更できます。"
         else:
             message = (
-                "写真はこのセッションには登録できましたが、"
-                "Supabase Storageへの保存に失敗しました。"
-                "Storageに「diary-photos」bucketを作成しているか確認してください。"
-                f" エラー: {error}"
+                "写真は端末上では登録できましたが、共有用の保存に失敗しました。"
+                "通信環境を確認して、もう一度写真を保存してください。"
+                f"（詳細: {error}）"
             )
     else:
         message = (
@@ -1129,9 +1306,9 @@ def render_public_diary():
 
     if err:
         st.warning(
-            "公開旅日記を読み込めませんでした。"
-            "Supabaseに public_diary テーブルがあるか確認してください。"
-            f" エラー: {err}"
+            "みんなの足跡を読み込めませんでした。"
+            "通信環境またはSupabase接続設定を確認してください。"
+            f"（詳細: {err}）"
         )
         return
 
@@ -1518,7 +1695,7 @@ def apply_theme():
 
 def usage_guide():
     with st.expander("📘 はじめての方へ｜アプリの使い方", expanded=not st.session_state.guide_seen):
-        st.markdown("**① クエストを選ぶ** → **② 現地で写真を登録してCLEAR** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記は「🔒 プライベート / 🌍 全体公開」を選べる** → **⑥ 全体公開を選ぶと「みんなの足跡」に表示** → **⑦ 最後に「🏁 クエスト終了」から旅を振り返る**")
+        st.markdown("**① クエストを選ぶ** → **② 現地で写真を登録してCLEAR** → **③ キャラクター獲得** → **④ ストーリーにも挑戦** → **⑤ 旅日記は「🔒 プライベート / 🌍 全体公開」を選べる** → **⑥ 全体公開で保存すると写真・感想が「みんなの足跡」に表示** → **⑦ 最後に「🏁 クエスト終了」から旅を振り返る**")
         if not st.session_state.guide_seen and st.button("✅ 使い方を確認しました", use_container_width=True): st.session_state.guide_seen = True; save_user_data(); st.rerun()
 
 def recommend(qs, purpose, area, season, kw):

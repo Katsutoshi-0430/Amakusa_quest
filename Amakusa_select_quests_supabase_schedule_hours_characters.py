@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""天草つながりクエスト / Streamlit テストマーケティング版"""
+"""天草つながりクエスト / Streamlit テストマーケティング版（Supabase修正・軽量化）"""
 from __future__ import annotations
 
-import base64
 import html
 import json
 import math
@@ -10,8 +9,9 @@ import re
 import urllib.parse
 import uuid
 from datetime import date, datetime, timezone, timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -24,10 +24,6 @@ except ModuleNotFoundError:
     folium = None
     st_folium = None
 
-try:
-    from streamlit_js_eval import get_geolocation
-except ModuleNotFoundError:
-    get_geolocation = None
 
 try:
     from supabase import create_client, Client
@@ -133,6 +129,10 @@ for q in QUESTS + STORY_QUESTS:
         if "2026年度" in q["time_info"]:
             q["period"] = q["time_info"]
 
+# 頻繁なクエスト検索をO(1)にして描画を軽量化
+ALL_QUESTS = QUESTS + STORY_QUESTS
+QUEST_BY_ID = {q["quest_id"]: q for q in ALL_QUESTS}
+
 # =====================================================================
 # キャラクター
 # =====================================================================
@@ -196,10 +196,10 @@ def jp_now():
     except Exception: return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
 def get_quest(qid):
-    return next((q for q in QUESTS + STORY_QUESTS if q["quest_id"] == qid), {})
+    return QUEST_BY_ID.get(qid, {})
 
 def init_state():
-    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, quest_session_ended=False, quest_end_feedback={}, map_selected_qid="", nickname="", admin_authenticated=False)
+    defaults = dict(completed=set(), completed_order=[], completed_at={}, favorites=set(), notes={}, photos={}, photo_data={}, photo_mime={}, photo_storage_paths={}, photo_edit_open=set(), diary_visibility={}, sns_texts={}, diary={}, unlocked_character_ids=set(), unlocked_character_order=[], quest_character_rewards={}, user_lat=None, user_lon=None, user_accuracy=None, user_location_source="未取得", gps_required=True, gps_radius_m=300, manual_location_enabled=False, apples=0, character_apples={}, last_login_date=None, story_progress=0, participant_id="", data_loaded=False, clear_effect=None, clear_effect_counter=0, profile_age="", guide_seen=False, survey_answers={}, survey_submitted=False, survey_submitted_at=None, quest_session_ended=False, quest_end_feedback={}, map_selected_qid="", nickname="", admin_authenticated=False, participant_db_ready_for="")
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
@@ -293,36 +293,9 @@ def upload_diary_photo_to_supabase(qid, uploaded_file):
         return False, "", str(e)
 
 def diary_photo_signed_url(qid, expires_in=3600):
-    """
-    private bucket の写真を表示するための一時URLを取得する。
-    """
+    """private bucket の登録写真を表示するための一時URLを取得する。"""
     storage_path = st.session_state.photo_storage_paths.get(qid, "")
-    if not storage_path or not supabase_configured():
-        return ""
-
-    try:
-        result = (
-            get_supabase_client()
-            .storage
-            .from_(diary_photo_bucket())
-            .create_signed_url(storage_path, expires_in)
-        )
-
-        if isinstance(result, dict):
-            return (
-                result.get("signedURL")
-                or result.get("signedUrl")
-                or result.get("signed_url")
-                or ""
-            )
-
-        return (
-            getattr(result, "signedURL", "")
-            or getattr(result, "signed_url", "")
-            or ""
-        )
-    except Exception:
-        return ""
+    return diary_photo_signed_url_from_path(storage_path, expires_in)
 
 def registered_photo_source(qid):
     """
@@ -340,6 +313,7 @@ def registered_photo_source(qid):
     return ""
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def diary_photo_signed_url_from_path(storage_path, expires_in=3600):
     """
     private bucket 内の任意パスから署名付きURLを作る。
@@ -441,6 +415,7 @@ def save_public_diary_entry(qid):
             except Exception:
                 # もともと行がなくても問題なし
                 pass
+            _load_public_diary_rows_cached.clear()
             return True, "旅日記をプライベートに設定しました。"
 
         if qid not in st.session_state.completed:
@@ -490,33 +465,35 @@ def save_public_diary_entry(qid):
         else:
             sb.table(table).insert(row).execute()
 
+        _load_public_diary_rows_cached.clear()
         return True, "旅日記を全体公開しました。"
 
     except Exception as e:
         return False, str(e)
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_public_diary_rows_cached(table_name):
+    """公開旅日記のDB取得だけを短時間キャッシュして再描画を高速化。"""
+    sb = get_supabase_client()
+    if sb is None:
+        return []
+    return (
+        sb.table(table_name)
+        .select("*")
+        .eq("visibility", "public")
+        .order("updated_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
 def load_public_diary_rows():
-    """
-    みんなの足跡用の公開旅日記を取得する。
-    """
+    """みんなの足跡用の公開旅日記を取得する。"""
     if not supabase_configured():
         return [], "Supabaseが設定されていません。"
 
-    sb = get_supabase_client()
-    if sb is None:
-        return [], "Supabaseに接続できません。"
-
     try:
-        rows = (
-            sb.table(public_diary_table())
-            .select("*")
-            .eq("visibility", "public")
-            .order("updated_at", desc=True)
-            .execute()
-            .data
-            or []
-        )
-
+        rows = _load_public_diary_rows_cached(public_diary_table())
         normalized = []
         for r in rows:
             qid = str(r.get("quest_id", "")).strip()
@@ -530,9 +507,7 @@ def load_public_diary_rows():
             item["area"] = item.get("area") or classified_area(q)
             item["photo_url"] = diary_photo_signed_url_from_path(item.get("photo_storage_path", ""))
             normalized.append(item)
-
         return normalized, ""
-
     except Exception as e:
         return [], str(e)
 
@@ -717,14 +692,112 @@ def render_registered_photo_editor(qid, scope):
     return existing
 
 
+def ensure_current_participant():
+    """
+    quest_progress の外部キー先 participants を必ず先に用意する。
+    これにより 23503 / quest_progress_participant_id_fkey を防ぐ。
+    """
+    pid = str(st.session_state.get("participant_id", "") or "").strip()
+    if not pid:
+        return False
+    if not supabase_configured():
+        return True
+
+    if st.session_state.get("participant_db_ready_for") == pid:
+        return True
+
+    sb = get_supabase_client()
+    if sb is None:
+        return False
+
+    nickname = str(st.session_state.get("nickname", "") or "").strip()
+
+    # まず既存レコードを確認。再訪者ならINSERT不要。
+    try:
+        existing = (
+            sb.table("participants")
+            .select("participant_id")
+            .eq("participant_id", pid)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if existing:
+            st.session_state.participant_db_ready_for = pid
+            return True
+    except Exception:
+        pass
+
+    # DB世代差に対応するため nickname あり → participant_idのみ の順で試す。
+    payloads = []
+    if nickname:
+        payloads.append({"participant_id": pid, "nickname": nickname})
+    payloads.append({"participant_id": pid})
+
+    last_error = None
+    for payload in payloads:
+        try:
+            sb.table("participants").insert(payload).execute()
+            st.session_state.participant_db_ready_for = pid
+            return True
+        except Exception as e:
+            last_error = e
+            # 競合等で既に作成済みなら成功扱いにする。
+            try:
+                existing = (
+                    sb.table("participants")
+                    .select("participant_id")
+                    .eq("participant_id", pid)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                if existing:
+                    st.session_state.participant_db_ready_for = pid
+                    return True
+            except Exception:
+                pass
+
+    if last_error is not None:
+        st.session_state["last_supabase_error"] = str(last_error)
+    return False
+
 def upsert_progress(row):
     sb = get_supabase_client()
-    if sb is None: return False
+    if sb is None:
+        return False
+
+    if not ensure_current_participant():
+        return False
+
     pid, qid = row["participant_id"], row["quest_id"]
-    found = sb.table("quest_progress").select("*").eq("participant_id", pid).eq("quest_id", qid).limit(1).execute().data or []
-    if found: sb.table("quest_progress").update(row).eq("participant_id", pid).eq("quest_id", qid).execute()
-    else: sb.table("quest_progress").insert(row).execute()
-    return True
+
+    # 通常は1リクエストで保存。既存DBに複合UNIQUEが無い場合だけ従来方式へフォールバック。
+    try:
+        sb.table("quest_progress").upsert(
+            row, on_conflict="participant_id,quest_id"
+        ).execute()
+        return True
+    except Exception:
+        found = (
+            sb.table("quest_progress")
+            .select("participant_id,quest_id")
+            .eq("participant_id", pid)
+            .eq("quest_id", qid)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if found:
+            sb.table("quest_progress").update(row).eq(
+                "participant_id", pid
+            ).eq("quest_id", qid).execute()
+        else:
+            sb.table("quest_progress").insert(row).execute()
+        return True
 
 def save_app_state_supabase():
     pid = st.session_state.participant_id.strip()
@@ -911,25 +984,23 @@ def save_survey_to_quest_progress(payload):
     })
 
 def save_user_data():
-    try:
-        SAVE_FILE.write_text(
-            json.dumps(state_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-    except Exception:
-        pass
+    # 本番(Supabase)では共有ローカルファイルを書かない。ローカル開発時のみ使用。
+    if not supabase_configured():
+        try:
+            SAVE_FILE.write_text(
+                json.dumps(state_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     try:
         save_app_state_supabase()
     except Exception:
         pass
 
-    # 名前・年代も独立して保存し、管理者集計で確実に拾えるようにする
-    try:
-        if st.session_state.participant_id and st.session_state.nickname and st.session_state.profile_age:
-            save_profile_to_supabase()
-    except Exception:
-        pass
+    # profile は初回登録・参加者情報変更・アンケート送信時に明示保存する。
+    # 毎回のクエスト操作で重複保存しないことで通信量を削減。
 
 def load_user_data():
     pid = st.session_state.participant_id.strip()
@@ -942,6 +1013,8 @@ def load_user_data():
             return
         try:
             rows = get_supabase_client().table("quest_progress").select("*").eq("participant_id", pid).execute().data or []
+            if rows:
+                st.session_state.participant_db_ready_for = pid
             app = next((r for r in rows if r.get("quest_id") == APP_STATE_QUEST_ID), None)
             if app and app.get("note"):
                 apply_state(json.loads(app["note"]))
@@ -1018,6 +1091,7 @@ def display_quest(q):
         else: d.update(quest_name=f"ストーリーモード第{c}章（シークレット）", linked_name="シークレット", description="前の章をクリアすると目的地と内容が解放されます。", condition="前のストーリークエストをクリアする", official_url="")
     return d
 
+@lru_cache(maxsize=256)
 def find_local_image(folder: Path, stem: str):
     for ext in IMG_EXTS:
         p = folder / f"{stem}.{ext}"
@@ -1031,6 +1105,7 @@ def render_place_photo(q, compact=False):
         h = 110 if compact else 210
         st.markdown(f'<div style="height:{h}px;border-radius:18px;background:#edf8ff;border:1px solid #cfeafa;display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px;font-weight:800;color:#24506b">📍 {html.escape(q.get("linked_name", "天草のクエスト"))}</div>', unsafe_allow_html=True)
 
+@lru_cache(maxsize=256)
 def character_image_path(img_id):
     p = find_local_image(CHARACTER_IMAGE_DIR, img_id)
     if p: return str(p)
@@ -1208,6 +1283,10 @@ def render_private_diary():
         if qid in st.session_state.completed
     ]
 
+    if not done:
+        st.info("まだ足跡はありません。クエストをクリアすると表示されます。")
+        return
+
     if folium is not None and st_folium is not None:
         m = folium.Map(location=[32.43, 130.19], zoom_start=9)
         for i, qid in enumerate(done, 1):
@@ -1220,10 +1299,6 @@ def render_private_diary():
                     icon=folium.Icon(color="green", icon="check"),
                 ).add_to(m)
         st_folium(m, width=None, height=450, key="diary_map")
-
-    if not done:
-        st.info("まだ足跡はありません。クエストをクリアすると表示されます。")
-        return
 
     for qid in reversed(done):
         q = get_quest(qid)
@@ -1634,7 +1709,7 @@ def render_survey():
         "おそらく利用していなかった", "利用していなかったと思う", "わからない"
     ]
 
-    places = list(dict.fromkeys([q["linked_name"] for q in QUESTS + STORY_QUESTS]))
+    places = list(dict.fromkeys([q["linked_name"] for q in ALL_QUESTS]))
 
     st.markdown("### ■ あなた自身について")
 
@@ -1919,10 +1994,17 @@ def render_survey():
             f" エラー: {err}"
         )
     else:
-        st.error(
-            "アンケートをSupabaseへ保存できませんでした。"
-            "Streamlit Secrets の SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY を確認してください。"
-        )
+        detail = st.session_state.get("last_supabase_error", "")
+        if detail:
+            st.error(
+                "アンケートをSupabaseへ保存できませんでした。"
+                f" 参加者情報の登録または保存でエラーが発生しました: {detail}"
+            )
+        else:
+            st.error(
+                "アンケートをSupabaseへ保存できませんでした。"
+                "Streamlit Secrets と participants / quest_progress の設定を確認してください。"
+            )
 
 
 # =====================================================================
@@ -2439,10 +2521,17 @@ if (
             except Exception:
                 pass
 
+            # quest_progress保存前に外部キー先participantsを作成
+            participant_ready = False
+            try:
+                participant_ready = ensure_current_participant()
+            except Exception:
+                participant_ready = False
+
             # 初回年代を独立行でも保存
             profile_saved = False
             try:
-                profile_saved = save_profile_to_supabase()
+                profile_saved = participant_ready and save_profile_to_supabase()
             except Exception:
                 profile_saved = False
 
@@ -2567,27 +2656,71 @@ with c2:
 # GPSによるCLEAR判定は廃止。
 # クエスト場所の固定座標はマップ表示のみに使用します。
 
-main_tab, list_tab, story_tab, diary_tab, char_tab, summary_tab, survey_tab = st.tabs(["🌟 おすすめ", "🗺️ 全クエスト", "📖 ストーリー", "👣 旅日記", "🎁 図鑑", "🎒 旅まとめ", "📝 アンケート"])
-with main_tab:
+# st.tabs は非表示タブも毎回実行するため、起動時に全クエスト・地図・アンケートまで
+# 同時描画されて重くなる。表示内容は変えず、選択中の1画面だけ描画する。
+MENU_OPTIONS = [
+    "🌟 おすすめ", "🗺️ 全クエスト", "📖 ストーリー",
+    "👣 旅日記", "🎁 図鑑", "🎒 旅まとめ", "📝 アンケート",
+]
+active_menu = st.radio(
+    "メニュー",
+    MENU_OPTIONS,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_navigation",
+)
+
+if active_menu == "🌟 おすすめ":
     st.subheader("あなたにおすすめの地域つながりクエスト")
     cols = st.columns(3)
     for i, q in enumerate(QUESTS[:12]):
-        with cols[i % 3]: quest_card(q, f"main_{i}")
-with list_tab:
-    f = st.columns(4); p = f[0].selectbox("目的", ["すべて"] + OBJECTIVES); a = f[1].selectbox("エリア", ["すべて", "上天草", "天草", "苓北"]); s = f[2].selectbox("行く時期", SEASONS, index=len(SEASONS)-1); kw = f[3].text_input("キーワード")
-    qs = recommend(QUESTS + STORY_QUESTS, p, a, s, kw); render_map(qs); st.markdown(f"### クエスト一覧（{len(qs)}件）")
-    for i, q in enumerate(qs): quest_card(display_quest(q), f"list_{i}")
-with story_tab:
-    st.subheader("📖 天草四郎ストーリーモード"); cover = find_local_image(STORY_ASSET_DIR, "story_cover")
-    if cover: st.image(str(cover), use_container_width=True)
-    st.progress(st.session_state.story_progress/len(STORY_QUESTS), text=f"進行：{st.session_state.story_progress}/{len(STORY_QUESTS)}章")
-    for i, q in enumerate(STORY_QUESTS, 1): st.markdown(f"## 第{i}章"); quest_card(display_quest(q), f"story_{i}")
-with diary_tab: render_diary()
-with char_tab:
-    st.subheader("🎁 キャラクター図鑑 & 育成"); st.metric("所持リンゴ", f"{st.session_state.apples} 🍎"); ids = list(dict.fromkeys(QUEST_CHARACTER_REWARDS.values())); cols = st.columns(3)
+        with cols[i % 3]:
+            quest_card(q, f"main_{i}")
+
+elif active_menu == "🗺️ 全クエスト":
+    f = st.columns(4)
+    p = f[0].selectbox("目的", ["すべて"] + OBJECTIVES)
+    a = f[1].selectbox("エリア", ["すべて", "上天草", "天草", "苓北"])
+    s = f[2].selectbox("行く時期", SEASONS, index=len(SEASONS) - 1)
+    kw = f[3].text_input("キーワード")
+    qs = recommend(ALL_QUESTS, p, a, s, kw)
+    render_map(qs)
+    st.markdown(f"### クエスト一覧（{len(qs)}件）")
+    for i, q in enumerate(qs):
+        quest_card(display_quest(q), f"list_{i}")
+
+elif active_menu == "📖 ストーリー":
+    st.subheader("📖 天草四郎ストーリーモード")
+    cover = find_local_image(STORY_ASSET_DIR, "story_cover")
+    if cover:
+        st.image(str(cover), use_container_width=True)
+    st.progress(
+        st.session_state.story_progress / len(STORY_QUESTS),
+        text=f"進行：{st.session_state.story_progress}/{len(STORY_QUESTS)}章",
+    )
+    for i, q in enumerate(STORY_QUESTS, 1):
+        st.markdown(f"## 第{i}章")
+        quest_card(display_quest(q), f"story_{i}")
+
+elif active_menu == "👣 旅日記":
+    render_diary()
+
+elif active_menu == "🎁 図鑑":
+    st.subheader("🎁 キャラクター図鑑 & 育成")
+    st.metric("所持リンゴ", f"{st.session_state.apples} 🍎")
+    ids = list(dict.fromkeys(QUEST_CHARACTER_REWARDS.values()))
+    cols = st.columns(3)
     for i, cid in enumerate(ids):
-        with cols[i % 3]: render_character(get_character_stage(cid), locked=cid not in st.session_state.unlocked_character_ids)
-with summary_tab: render_summary()
-with survey_tab: render_survey()
+        with cols[i % 3]:
+            render_character(
+                get_character_stage(cid),
+                locked=cid not in st.session_state.unlocked_character_ids,
+            )
+
+elif active_menu == "🎒 旅まとめ":
+    render_summary()
+
+elif active_menu == "📝 アンケート":
+    render_survey()
 
 st.divider(); st.caption("天草つながりクエスト｜テストマーケティング版")

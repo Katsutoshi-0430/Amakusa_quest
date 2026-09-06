@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""天草つながりクエスト / Streamlit テストマーケティング版（Supabase修正・軽量化）"""
+"""天草つながりクエスト / Streamlit テストマーケティング版
+参加者ID＝入力した名前。旧AMK-IDは同名データを保持したまま名前IDへ統合。
+"""
 from __future__ import annotations
 
 import html
@@ -380,7 +382,7 @@ def render_visibility_selector(qid, scope):
     if visibility == "public":
         st.info(
             "全体公開にすると、"
-            "ニックネーム・写真・感想が"
+            "お名前・写真・感想が"
             "「みんなの足跡マップ」に表示されます。"
             "位置は現在地ではなく、このクエスト場所の固定ピンで表示されます。"
         )
@@ -821,6 +823,22 @@ def find_participant_ids_by_nickname(nickname):
     nick_map = _participant_nickname_map()
     ids = [pid for pid, nick in nick_map.items() if nick == nickname]
 
+    # 新仕様では participant_id 自体が名前。nickname列がないDBでも再訪を検出できる。
+    try:
+        direct = (
+            get_supabase_client().table("participants")
+            .select("participant_id")
+            .eq("participant_id", nickname)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if direct and nickname not in ids:
+            ids.append(nickname)
+    except Exception:
+        pass
+
     # profile/app_state にしか名前が無い古いIDも拾う
     sb = get_supabase_client()
     if sb is not None:
@@ -948,7 +966,9 @@ def merge_participants_by_nickname(nickname):
     if not ids:
         return "", 0, ""
 
-    canonical = choose_canonical_participant_id(ids)
+    # この版では「参加者ID＝入力した名前」とする。
+    # 以前の AMK-... ID が複数あっても、入力名そのものを代表IDにする。
+    canonical = nickname
     if not canonical:
         return "", 0, ""
 
@@ -964,6 +984,30 @@ def merge_participants_by_nickname(nickname):
     sb = get_supabase_client()
     if sb is None:
         return canonical, 0, "Supabaseに接続できません。"
+
+    # quest_progress の外部キー先として、名前＝IDの participants 行を先に作る。
+    try:
+        existing_target = (
+            sb.table("participants")
+            .select("participant_id")
+            .eq("participant_id", canonical)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not existing_target:
+            try:
+                sb.table("participants").insert({
+                    "participant_id": canonical,
+                    "nickname": nickname,
+                }).execute()
+            except Exception:
+                sb.table("participants").insert({
+                    "participant_id": canonical
+                }).execute()
+    except Exception:
+        pass
 
     # 全ソース行を取得
     all_rows = {}
@@ -1202,7 +1246,7 @@ def ensure_current_participant():
     if sb is None:
         return False
 
-    nickname = str(st.session_state.get("nickname", "") or "").strip()
+    nickname = pid
 
     # まず既存レコードを確認。再訪者ならINSERT不要。
     try:
@@ -1294,6 +1338,7 @@ def upsert_progress(row):
 def save_app_state_supabase():
     pid = st.session_state.participant_id.strip()
     if not pid or not supabase_configured(): return False
+    st.session_state.nickname = pid  # 旧データ互換。画面上のニックネーム概念は使用しない。
     return upsert_progress({"participant_id": pid, "quest_id": APP_STATE_QUEST_ID, "completed": False, "completed_at": None, "favorite": False, "note": json.dumps(state_dict(), ensure_ascii=False), "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""})
 
 def save_quest_supabase(qid):
@@ -1306,7 +1351,7 @@ def save_quest_supabase(qid):
 def profile_payload():
     return {
         "participant_id": st.session_state.participant_id.strip(),
-        "nickname": str(st.session_state.get("nickname", "")).strip(),
+        "nickname": st.session_state.participant_id.strip(),
         "age": str(st.session_state.get("profile_age", "")).strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1514,6 +1559,9 @@ def load_user_data():
             profile = next((r for r in rows if r.get("quest_id") == PROFILE_QUEST_ID), None)
             if profile:
                 _load_profile_from_row(profile)
+
+            # 新仕様では participant_id が表示名そのもの。旧nicknameは内部互換用。
+            st.session_state.nickname = pid
 
             survey = next((r for r in rows if r.get("quest_id") == SURVEY_QUEST_ID), None)
             if survey and survey.get("note"):
@@ -2554,7 +2602,7 @@ def build_admin_profile_df(rows):
         if pid not in by_pid:
             by_pid[pid] = {
                 "participant_id": pid,
-                "ニックネーム": "",
+                "名前": "",
                 "初回年代": "",
                 "年代の取得元": "",
                 "最終更新": "",
@@ -2571,7 +2619,7 @@ def build_admin_profile_df(rows):
             data = _json_note(row)
             rec = ensure(pid)
             if data.get("nickname"):
-                rec["ニックネーム"] = data.get("nickname")
+                rec["名前"] = data.get("nickname")
             if data.get("profile_age"):
                 rec["初回年代"] = data.get("profile_age")
                 rec["年代の取得元"] = "既存app_state"
@@ -2588,8 +2636,8 @@ def build_admin_profile_df(rows):
             if not rec["初回年代"] and data.get("age"):
                 rec["初回年代"] = data.get("age")
                 rec["年代の取得元"] = "既存アンケート"
-            if not rec["ニックネーム"] and data.get("nickname"):
-                rec["ニックネーム"] = data.get("nickname")
+            if not rec["名前"] and data.get("nickname"):
+                rec["名前"] = data.get("nickname")
             if data.get("submitted_at"):
                 rec["最終更新"] = data.get("submitted_at")
 
@@ -2602,7 +2650,7 @@ def build_admin_profile_df(rows):
             data = _json_note(row)
             rec = ensure(pid)
             if data.get("nickname"):
-                rec["ニックネーム"] = data.get("nickname")
+                rec["名前"] = data.get("nickname")
             if data.get("age"):
                 rec["初回年代"] = data.get("age")
                 rec["年代の取得元"] = "初回入力"
@@ -2817,9 +2865,9 @@ def render_admin_mode():
                 st.rerun()
 
         # 既存の同名・複数IDを管理者操作で一括統合できる。
-        with st.expander("🔗 既存の同名IDを統合する", expanded=False):
+        with st.expander("🔗 旧IDを「名前＝ID」に統合する", expanded=False):
             st.caption(
-                "同じニックネームに複数の参加者IDがある場合、代表IDへ進捗を集約します。"
+                "同じ名前で過去に複数の参加者IDが作られている場合、名前そのものをIDとして進捗を集約します。"
                 "元IDのデータは削除せず、統合済みとして保持します。"
             )
             nick_map = _participant_nickname_map()
@@ -2830,7 +2878,7 @@ def render_admin_mode():
             duplicate_groups = {k: v for k, v in groups.items() if len(v) >= 2}
             if duplicate_groups:
                 st.write("統合対象：" + "、".join([f"{k}（{len(v)}ID）" for k, v in duplicate_groups.items()]))
-                if st.button("同名IDを一括統合する", key="admin_merge_duplicate_nicknames", type="primary", use_container_width=True):
+                if st.button("旧IDを名前IDへ一括統合する", key="admin_merge_duplicate_nicknames", type="primary", use_container_width=True):
                     merged_total = 0
                     errors = []
                     for _nick in list(duplicate_groups.keys()):
@@ -2845,7 +2893,7 @@ def render_admin_mode():
                         st.success(f"統合しました。旧ID {merged_total}件を代表IDへ集約しました。")
                     st.rerun()
             else:
-                st.success("現在、未統合の同名・複数IDはありません。")
+                st.success("現在、未統合の旧ID・複数IDはありません。")
 
         rows, error = load_all_quest_progress_rows()
         if error:
@@ -2868,14 +2916,14 @@ def render_admin_mode():
             st.caption(f"同名統合済みの旧ID：{len(merged_source_ids)}件（集計から除外・元データはSupabaseに保持）")
 
         t1, t2, t3, t4 = st.tabs([
-            "👤 初回年代・参加者",
+            "👤 名前（ID）・年代",
             "⭐ 終了後アンケート",
             "📝 全体アンケート",
             "✅ クエスト記録",
         ])
 
         with t1:
-            st.subheader("初回に回答した年代・参加者")
+            st.subheader("参加者の名前（ID）・年代")
             st.caption(
                 "新しい参加者は __profile__ から表示。"
                 "既存参加者は、これまで保存済みの app_state / アンケートから可能な範囲で復元します。"
@@ -2997,11 +3045,26 @@ if not st.session_state.data_loaded:
     load_user_data()
     st.session_state.data_loaded = True
 
+# 以前の AMK-... URL / ID で再訪した場合も、保存済みの名前が分かれば
+# 自動的に「名前＝参加者ID」へ移行して同名データを統合する。
+if supabase_configured():
+    current_pid = str(st.session_state.get("participant_id", "") or "").strip()
+    saved_name = str(st.session_state.get("nickname", "") or "").strip()
+    if current_pid and saved_name and current_pid != saved_name:
+        try:
+            if switch_to_existing_participant(saved_name):
+                try:
+                    st.query_params["pid"] = st.session_state.participant_id
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------
 # ★ 初回大画面：参加者名 + 年代
 # ---------------------------------------------------------------------
 if (
-    not str(st.session_state.get("nickname", "")).strip()
+    not str(st.session_state.get("participant_id", "")).strip()
     or not str(st.session_state.get("profile_age", "")).strip()
 ):
     st.markdown(
@@ -3010,7 +3073,7 @@ if (
           <div class="title">🌊 天草つながりクエストへようこそ！</div>
           <div class="sub">
             最初に、参加者のお名前と年代を教えてください。<br>
-            お名前はニックネームでも大丈夫です。
+            入力したお名前が、そのままあなたの参加者IDになります。
           </div>
         </div>
         """,
@@ -3023,8 +3086,8 @@ if (
     )
 
     first_name = st.text_input(
-        "参加者のお名前（ニックネームでも可）",
-        value=str(st.session_state.get("nickname", "")),
+        "参加者のお名前（この名前が参加者IDになります）",
+        value=str(st.session_state.get("participant_id", "")),
         placeholder="例：めい",
         max_chars=30,
         key="initial_participant_name",
@@ -3058,7 +3121,7 @@ if (
         if missing:
             st.error("入力してください：" + "、".join(missing))
         else:
-            # まず同じニックネームの既存参加者を検索。
+            # まず同じ名前の既存参加者を検索。
             # 見つかれば新しいIDを作らず、その人の進捗を引き継ぐ。
             existing_loaded = False
             if supabase_configured():
@@ -3084,12 +3147,9 @@ if (
                 )
                 st.rerun()
 
-            # 同名が見つからない場合のみ、新しい参加者として登録
-            if not str(st.session_state.get("participant_id", "")).strip():
-                st.session_state.participant_id = (
-                    "AMK-" + uuid.uuid4().hex[:10].upper()
-                )
-
+            # 同じ名前の既存データが無い場合は、入力した名前そのものを参加者IDにする。
+            st.session_state.participant_id = first_name
+            # nickname は旧DB・公開旅日記との互換性のため内部だけで同じ値を保持する。
             st.session_state.nickname = first_name
             st.session_state.profile_age = first_age
 
@@ -3133,7 +3193,7 @@ st.markdown(
 )
 
 st.success(
-    f"👋 {st.session_state.nickname} さん、天草の旅を楽しみましょう！"
+    f"👋 {st.session_state.participant_id} さん、天草の旅を楽しみましょう！"
 )
 
 st.caption(
@@ -3141,13 +3201,14 @@ st.caption(
     "全体公開した写真は「みんなの足跡マップ」に表示されます。"
 )
 
-with st.expander("👤 参加者情報を変更する"):
-    new_nick = st.text_input(
-        "参加者のお名前（ニックネームでも可）",
-        value=st.session_state.nickname,
-        max_chars=30,
-        key="edit_participant_name",
-    ).strip()
+with st.expander("👤 参加者情報"):
+    st.text_input(
+        "お名前（参加者ID）",
+        value=st.session_state.participant_id,
+        disabled=True,
+        key="display_participant_id",
+    )
+    st.caption("同じ名前を入力すると、次回もこのIDの続きから再開します。")
 
     new_age = st.selectbox(
         "年代",
@@ -3156,27 +3217,20 @@ with st.expander("👤 参加者情報を変更する"):
         key="edit_participant_age",
     )
 
-    st.caption(
-        f"参加者ID：{st.session_state.participant_id}"
-    )
-
     if st.button(
-        "参加者情報を保存",
+        "年代を保存",
         use_container_width=True,
-        key="save_participant_name",
+        key="save_participant_age",
     ):
-        if not new_nick:
-            st.warning("参加者のお名前を入力してください。")
-        else:
-            st.session_state.nickname = new_nick
-            st.session_state.profile_age = new_age
-            try:
-                save_profile_to_supabase()
-            except Exception:
-                pass
-            save_user_data()
-            st.success("参加者情報を変更しました。")
-            st.rerun()
+        st.session_state.profile_age = new_age
+        st.session_state.nickname = st.session_state.participant_id
+        try:
+            save_profile_to_supabase()
+        except Exception:
+            pass
+        save_user_data()
+        st.success("年代を変更しました。")
+        st.rerun()
 
 usage_guide(); render_clear_effect()
 

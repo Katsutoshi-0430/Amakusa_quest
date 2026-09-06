@@ -41,6 +41,7 @@ APP_STATE_QUEST_ID = "__app_state__"
 SURVEY_QUEST_ID = "__survey__"
 PROFILE_QUEST_ID = "__profile__"
 SURVEY_HISTORY_PREFIX = "__survey_history__::"
+MERGED_INTO_QUEST_ID = "__merged_into__"
 
 AGE_OPTIONS = ["選択してください", "10代", "20代", "30代", "40代", "50代", "60代", "70代以上"]
 FEATURE_SURVEY_ITEMS = [
@@ -691,6 +692,497 @@ def render_registered_photo_editor(qid, scope):
 
     return existing
 
+
+def _safe_json_dict(text):
+    try:
+        obj = json.loads(text or "{}")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _merge_unique(seq_a, seq_b):
+    out = []
+    seen = set()
+    for x in list(seq_a or []) + list(seq_b or []):
+        key = str(x)
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    return out
+
+
+def _merge_state_dicts(base, incoming):
+    """同一人物の複数IDに分かれたapp_stateを安全側に寄せて統合する。"""
+    base = dict(base or {})
+    incoming = dict(incoming or {})
+
+    # 集合・順序系は和集合
+    for key in ["completed", "favorites", "unlocked_character_ids"]:
+        base[key] = list(dict.fromkeys(list(base.get(key, []) or []) + list(incoming.get(key, []) or [])))
+
+    for key in ["completed_order", "unlocked_character_order"]:
+        base[key] = _merge_unique(base.get(key, []), incoming.get(key, []))
+
+    # 辞書系は、空値で既存値を潰さない。進捗値は大きい方を優先。
+    for key in [
+        "completed_at", "notes", "photos", "photo_storage_paths", "diary_visibility",
+        "sns_texts", "diary", "quest_character_rewards", "quest_end_feedback"
+    ]:
+        merged = dict(base.get(key, {}) or {})
+        for k, v in dict(incoming.get(key, {}) or {}).items():
+            if k not in merged or merged.get(k) in (None, "", [], {}):
+                merged[k] = v
+        base[key] = merged
+
+    # キャラ育成は同一進捗の重複計上を避け、最大値を採用。
+    char_apples = dict(base.get("character_apples", {}) or {})
+    for cid, value in dict(incoming.get("character_apples", {}) or {}).items():
+        try:
+            char_apples[cid] = max(int(char_apples.get(cid, 0) or 0), int(value or 0))
+        except Exception:
+            if cid not in char_apples:
+                char_apples[cid] = value
+    base["character_apples"] = char_apples
+
+    for key in ["apples", "story_progress", "clear_effect_counter"]:
+        try:
+            base[key] = max(int(base.get(key, 0) or 0), int(incoming.get(key, 0) or 0))
+        except Exception:
+            pass
+
+    # 日付はより新しいもの、ブールはTrueを保持。
+    if str(incoming.get("last_login_date", "")) > str(base.get("last_login_date", "")):
+        base["last_login_date"] = incoming.get("last_login_date")
+    for key in ["guide_seen", "survey_submitted", "quest_session_ended"]:
+        base[key] = bool(base.get(key)) or bool(incoming.get(key))
+
+    # survey_answers は submitted_at が新しい方を採用（過去回答は別途履歴化する）。
+    b_survey = dict(base.get("survey_answers", {}) or {})
+    i_survey = dict(incoming.get("survey_answers", {}) or {})
+    if str(i_survey.get("submitted_at", "")) > str(b_survey.get("submitted_at", "")):
+        base["survey_answers"] = i_survey
+        base["survey_submitted_at"] = i_survey.get("submitted_at")
+    elif b_survey:
+        base["survey_answers"] = b_survey
+
+    # 名前・年代は既存値を優先し、欠損だけ補う。
+    for key in ["nickname", "profile_age"]:
+        if not str(base.get(key, "") or "").strip() and str(incoming.get(key, "") or "").strip():
+            base[key] = incoming.get(key)
+
+    return base
+
+
+def _participant_nickname_map():
+    """participants と quest_progress の両方から participant_id -> nickname を復元。"""
+    if not supabase_configured():
+        return {}
+    sb = get_supabase_client()
+    if sb is None:
+        return {}
+
+    result = {}
+    try:
+        for row in (sb.table("participants").select("participant_id,nickname").execute().data or []):
+            pid = str(row.get("participant_id", "") or "").strip()
+            nick = str(row.get("nickname", "") or "").strip()
+            if pid and nick:
+                result[pid] = nick
+    except Exception:
+        pass
+
+    try:
+        rows = (
+            sb.table("quest_progress")
+            .select("participant_id,quest_id,note")
+            .in_("quest_id", [PROFILE_QUEST_ID, APP_STATE_QUEST_ID])
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            pid = str(row.get("participant_id", "") or "").strip()
+            data = _safe_json_dict(row.get("note"))
+            nick = str(data.get("nickname") or data.get("participant_name") or "").strip()
+            if pid and nick and pid not in result:
+                result[pid] = nick
+    except Exception:
+        pass
+    return result
+
+
+def find_participant_ids_by_nickname(nickname):
+    """同じニックネームに紐づく全 participant_id を返す。統合済みIDも追跡する。"""
+    nickname = str(nickname or "").strip()
+    if not nickname or not supabase_configured():
+        return []
+
+    nick_map = _participant_nickname_map()
+    ids = [pid for pid, nick in nick_map.items() if nick == nickname]
+
+    # profile/app_state にしか名前が無い古いIDも拾う
+    sb = get_supabase_client()
+    if sb is not None:
+        try:
+            rows = (
+                sb.table("quest_progress")
+                .select("participant_id,quest_id,note")
+                .in_("quest_id", [PROFILE_QUEST_ID, APP_STATE_QUEST_ID])
+                .execute()
+                .data
+                or []
+            )
+            for row in rows:
+                data = _safe_json_dict(row.get("note"))
+                saved = str(data.get("nickname") or data.get("participant_name") or "").strip()
+                pid = str(row.get("participant_id", "") or "").strip()
+                if saved == nickname and pid and pid not in ids:
+                    ids.append(pid)
+        except Exception:
+            pass
+
+    return ids
+
+
+def _merged_target_for_pid(pid):
+    if not pid or not supabase_configured():
+        return ""
+    try:
+        rows = (
+            get_supabase_client().table("quest_progress")
+            .select("note")
+            .eq("participant_id", pid)
+            .eq("quest_id", MERGED_INTO_QUEST_ID)
+            .limit(1)
+            .execute().data or []
+        )
+        if rows:
+            data = _safe_json_dict(rows[0].get("note"))
+            return str(data.get("merged_into", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_merged_pid(pid):
+    seen = set()
+    cur = str(pid or "").strip()
+    while cur and cur not in seen:
+        seen.add(cur)
+        nxt = _merged_target_for_pid(cur)
+        if not nxt:
+            return cur
+        cur = nxt
+    return cur
+
+
+def _pid_data_score(pid):
+    """代表ID選定用。記録が最も多いIDを優先する。"""
+    if not pid or not supabase_configured():
+        return 0
+    try:
+        rows = (
+            get_supabase_client().table("quest_progress")
+            .select("quest_id,completed,note,photo_uploaded,character_id")
+            .eq("participant_id", pid)
+            .execute().data or []
+        )
+    except Exception:
+        return 0
+    score = len(rows)
+    for r in rows:
+        if r.get("completed"):
+            score += 3
+        if r.get("photo_uploaded"):
+            score += 2
+        if r.get("character_id"):
+            score += 1
+        if str(r.get("note") or "").strip():
+            score += 1
+    return score
+
+
+def choose_canonical_participant_id(ids):
+    resolved = []
+    for pid in ids:
+        target = _resolve_merged_pid(pid)
+        if target and target not in resolved:
+            resolved.append(target)
+    if not resolved:
+        return ""
+    return sorted(resolved, key=lambda p: (-_pid_data_score(p), p))[0]
+
+
+def _merged_progress_row(existing, incoming, canonical_pid):
+    """通常クエスト行を統合。クリア等を失わないようOR/非空優先。"""
+    if not existing:
+        out = dict(incoming)
+        out["participant_id"] = canonical_pid
+        return out
+    out = dict(existing)
+    out["participant_id"] = canonical_pid
+    out["completed"] = bool(existing.get("completed")) or bool(incoming.get("completed"))
+
+    dates = [d for d in [existing.get("completed_at"), incoming.get("completed_at")] if d]
+    if dates:
+        out["completed_at"] = min(map(str, dates))
+
+    out["favorite"] = bool(existing.get("favorite")) or bool(incoming.get("favorite"))
+    out["photo_uploaded"] = bool(existing.get("photo_uploaded")) or bool(incoming.get("photo_uploaded"))
+    for key in ["note", "sns_text", "x_post_url", "character_id"]:
+        if not str(out.get(key) or "").strip() and str(incoming.get(key) or "").strip():
+            out[key] = incoming.get(key)
+    return out
+
+
+def merge_participants_by_nickname(nickname):
+    """
+    同名の複数 participant_id を1つの代表IDへ論理統合する。
+    元IDのquest_progressは削除せず、__merged_into__ を残すため復元可能。
+    アンケートは最新回答を現在回答にし、それ以外は履歴として代表IDへコピーする。
+    戻り値: (canonical_pid, merged_count, message)
+    """
+    nickname = str(nickname or "").strip()
+    ids = find_participant_ids_by_nickname(nickname)
+    if not ids:
+        return "", 0, ""
+
+    canonical = choose_canonical_participant_id(ids)
+    if not canonical:
+        return "", 0, ""
+
+    # 既に同じ代表へ統合済みのIDを含めたソース一覧
+    raw_ids = []
+    for pid in ids:
+        if pid not in raw_ids:
+            raw_ids.append(pid)
+    source_ids = [pid for pid in raw_ids if pid != canonical]
+    if not source_ids:
+        return canonical, 0, "既存データを読み込みました。"
+
+    sb = get_supabase_client()
+    if sb is None:
+        return canonical, 0, "Supabaseに接続できません。"
+
+    # 全ソース行を取得
+    all_rows = {}
+    for pid in [canonical] + source_ids:
+        try:
+            all_rows[pid] = (
+                sb.table("quest_progress").select("*").eq("participant_id", pid).execute().data or []
+            )
+        except Exception:
+            all_rows[pid] = []
+
+    # 1) app_state 統合
+    merged_state = {}
+    for pid in [canonical] + source_ids:
+        app = next((r for r in all_rows[pid] if r.get("quest_id") == APP_STATE_QUEST_ID), None)
+        if app:
+            merged_state = _merge_state_dicts(merged_state, _safe_json_dict(app.get("note")))
+    merged_state["nickname"] = nickname
+    merged_state["participant_id"] = canonical
+    upsert_progress({
+        "participant_id": canonical, "quest_id": APP_STATE_QUEST_ID,
+        "completed": False, "completed_at": None, "favorite": False,
+        "note": json.dumps(merged_state, ensure_ascii=False),
+        "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+    })
+
+    # 2) profile 統合
+    profile = {"participant_id": canonical, "nickname": nickname, "age": "", "updated_at": datetime.now(timezone.utc).isoformat()}
+    for pid in [canonical] + source_ids:
+        row = next((r for r in all_rows[pid] if r.get("quest_id") == PROFILE_QUEST_ID), None)
+        data = _safe_json_dict(row.get("note")) if row else {}
+        if not profile["age"] and data.get("age"):
+            profile["age"] = data.get("age")
+    if not profile["age"]:
+        profile["age"] = merged_state.get("profile_age", "")
+    upsert_progress({
+        "participant_id": canonical, "quest_id": PROFILE_QUEST_ID,
+        "completed": False, "completed_at": None, "favorite": False,
+        "note": json.dumps(profile, ensure_ascii=False),
+        "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+    })
+
+    # 3) 通常クエスト・クエスト別アンケートを統合
+    special_prefixes = (SURVEY_HISTORY_PREFIX,)
+    skip_exact = {APP_STATE_QUEST_ID, PROFILE_QUEST_ID, SURVEY_QUEST_ID, MERGED_INTO_QUEST_ID}
+    merged_by_qid = {}
+    for pid in [canonical] + source_ids:
+        for row in all_rows[pid]:
+            qid = str(row.get("quest_id", ""))
+            if not qid or qid in skip_exact or qid.startswith(special_prefixes):
+                continue
+            prev = merged_by_qid.get(qid)
+            # quest feedback はsubmitted_atの新しい方、それ以外はOR統合
+            if qid.startswith(QUEST_FEEDBACK_PREFIX):
+                if prev is None:
+                    merged_by_qid[qid] = dict(row)
+                else:
+                    pdt = str(_safe_json_dict(prev.get("note")).get("submitted_at", prev.get("completed_at") or ""))
+                    idt = str(_safe_json_dict(row.get("note")).get("submitted_at", row.get("completed_at") or ""))
+                    if idt > pdt:
+                        merged_by_qid[qid] = dict(row)
+            else:
+                merged_by_qid[qid] = _merged_progress_row(prev, row, canonical)
+
+    for qid, row in merged_by_qid.items():
+        row = dict(row)
+        row["participant_id"] = canonical
+        upsert_progress(row)
+
+    # 4) アンケートは全回答を保持。最新を__survey__、残りを履歴へ。
+    surveys = []
+    for pid in [canonical] + source_ids:
+        for row in all_rows[pid]:
+            qid = str(row.get("quest_id", ""))
+            if qid == SURVEY_QUEST_ID or qid.startswith(SURVEY_HISTORY_PREFIX):
+                data = _safe_json_dict(row.get("note"))
+                if data:
+                    surveys.append((str(data.get("submitted_at") or row.get("completed_at") or ""), data))
+    # app_state内だけにある旧surveyも拾う
+    for pid in [canonical] + source_ids:
+        app = next((r for r in all_rows[pid] if r.get("quest_id") == APP_STATE_QUEST_ID), None)
+        data = _safe_json_dict(app.get("note")) if app else {}
+        legacy = data.get("survey_answers") or {}
+        if isinstance(legacy, dict) and legacy:
+            surveys.append((str(legacy.get("submitted_at") or ""), legacy))
+
+    # JSON内容で重複排除
+    uniq = {}
+    for dt, data in surveys:
+        key = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        uniq[key] = (dt, data)
+    surveys = sorted(uniq.values(), key=lambda x: x[0])
+    if surveys:
+        latest_dt, latest = surveys[-1]
+        upsert_progress({
+            "participant_id": canonical, "quest_id": SURVEY_QUEST_ID,
+            "completed": True, "completed_at": latest.get("submitted_at") or latest_dt or None,
+            "favorite": False, "note": json.dumps(latest, ensure_ascii=False),
+            "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+        })
+        for i, (dt, data) in enumerate(surveys[:-1], 1):
+            hid = SURVEY_HISTORY_PREFIX + "merged-" + re.sub(r"[^0-9]", "", dt)[:14] + f"-{i}-{uuid.uuid4().hex[:6]}"
+            sb.table("quest_progress").insert({
+                "participant_id": canonical, "quest_id": hid,
+                "completed": True, "completed_at": data.get("submitted_at") or dt or None,
+                "favorite": False, "note": json.dumps(data, ensure_ascii=False),
+                "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+            }).execute()
+
+    # 5) public_diary があれば代表IDへコピー。元行は残す。
+    try:
+        table = public_diary_table()
+        for source_pid in source_ids:
+            rows = sb.table(table).select("*").eq("participant_id", source_pid).execute().data or []
+            for row in rows:
+                qid = row.get("quest_id")
+                if not qid:
+                    continue
+                existing = sb.table(table).select("*").eq("participant_id", canonical).eq("quest_id", qid).limit(1).execute().data or []
+                payload = dict(row)
+                payload.pop("id", None)
+                payload["participant_id"] = canonical
+                payload["nickname"] = nickname
+                payload["updated_at"] = jp_now().isoformat()
+                if existing:
+                    sb.table(table).update(payload).eq("participant_id", canonical).eq("quest_id", qid).execute()
+                else:
+                    sb.table(table).insert(payload).execute()
+        _load_public_diary_rows_cached.clear()
+    except Exception:
+        pass
+
+    # 6) participants の代表行にnicknameを反映（列が無い旧DBなら無視）
+    try:
+        sb.table("participants").update({"nickname": nickname}).eq("participant_id", canonical).execute()
+    except Exception:
+        pass
+
+    # 7) 元IDに統合マーカーを保存。元データそのものは削除しない。
+    for source_pid in source_ids:
+        marker = {
+            "merged_into": canonical,
+            "nickname": nickname,
+            "merged_at": datetime.now(timezone.utc).isoformat(),
+            "source_participant_id": source_pid,
+        }
+        try:
+            # source側participantがあるため直接upsert
+            sb.table("quest_progress").upsert({
+                "participant_id": source_pid, "quest_id": MERGED_INTO_QUEST_ID,
+                "completed": False, "completed_at": None, "favorite": False,
+                "note": json.dumps(marker, ensure_ascii=False),
+                "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+            }, on_conflict="participant_id,quest_id").execute()
+        except Exception:
+            try:
+                found = sb.table("quest_progress").select("participant_id").eq("participant_id", source_pid).eq("quest_id", MERGED_INTO_QUEST_ID).limit(1).execute().data or []
+                if found:
+                    sb.table("quest_progress").update({"note": json.dumps(marker, ensure_ascii=False)}).eq("participant_id", source_pid).eq("quest_id", MERGED_INTO_QUEST_ID).execute()
+                else:
+                    sb.table("quest_progress").insert({
+                        "participant_id": source_pid, "quest_id": MERGED_INTO_QUEST_ID,
+                        "completed": False, "completed_at": None, "favorite": False,
+                        "note": json.dumps(marker, ensure_ascii=False),
+                        "photo_uploaded": False, "sns_text": "", "x_post_url": "", "character_id": ""
+                    }).execute()
+            except Exception:
+                pass
+
+    return canonical, len(source_ids), f"同じ名前の{len(source_ids) + 1}件のIDを1人分に統合しました。"
+
+
+def find_participant_id_by_nickname(nickname):
+    ids = find_participant_ids_by_nickname(nickname)
+    if not ids:
+        return ""
+    return choose_canonical_participant_id(ids)
+
+
+def switch_to_existing_participant(nickname):
+    """同名IDが複数なら統合してから、代表IDのデータを読み込む。"""
+    pid, merged_count, _ = merge_participants_by_nickname(nickname)
+    if not pid:
+        return False
+
+    preserved_admin = st.session_state.get("admin_authenticated", False)
+    for key in list(state_dict().keys()):
+        if key in st.session_state:
+            del st.session_state[key]
+
+    for key in [
+        "photo_data", "photo_mime", "photo_edit_open",
+        "user_lat", "user_lon", "user_accuracy",
+        "user_location_source", "gps_required", "gps_radius_m",
+        "manual_location_enabled", "data_loaded", "clear_effect",
+        "clear_effect_counter", "map_selected_qid",
+        "participant_db_ready_for", "admin_authenticated"
+    ]:
+        st.session_state.pop(key, None)
+
+    init_state()
+    st.session_state.admin_authenticated = preserved_admin
+    st.session_state.participant_id = pid
+    st.session_state.nickname = nickname
+    st.session_state.data_loaded = False
+
+    load_user_data()
+    st.session_state.data_loaded = True
+
+    if not str(st.session_state.get("nickname", "")).strip():
+        st.session_state.nickname = nickname
+
+    try:
+        st.query_params["pid"] = pid
+    except Exception:
+        pass
+
+    st.session_state["last_merge_count"] = merged_count
+    return True
 
 def ensure_current_participant():
     """
@@ -2018,6 +2510,22 @@ def _json_note(row):
     except Exception:
         return {}
 
+def filter_merged_source_rows(rows):
+    """統合元IDを管理者集計から除外し、二重カウントを防ぐ。元データ自体はSupabaseに残る。"""
+    merged_sources = set()
+    for row in rows or []:
+        if str(row.get("quest_id", "")) == MERGED_INTO_QUEST_ID:
+            pid = str(row.get("participant_id", "") or "").strip()
+            if pid:
+                merged_sources.add(pid)
+    active = [
+        row for row in (rows or [])
+        if str(row.get("participant_id", "") or "").strip() not in merged_sources
+        and str(row.get("quest_id", "")) != MERGED_INTO_QUEST_ID
+    ]
+    return active, merged_sources
+
+
 def load_all_quest_progress_rows():
     if not supabase_configured():
         return [], "Supabaseが設定されていません。"
@@ -2308,10 +2816,43 @@ def render_admin_mode():
                 st.session_state.admin_authenticated = False
                 st.rerun()
 
+        # 既存の同名・複数IDを管理者操作で一括統合できる。
+        with st.expander("🔗 既存の同名IDを統合する", expanded=False):
+            st.caption(
+                "同じニックネームに複数の参加者IDがある場合、代表IDへ進捗を集約します。"
+                "元IDのデータは削除せず、統合済みとして保持します。"
+            )
+            nick_map = _participant_nickname_map()
+            groups = {}
+            for _pid, _nick in nick_map.items():
+                if _nick:
+                    groups.setdefault(_nick, []).append(_pid)
+            duplicate_groups = {k: v for k, v in groups.items() if len(v) >= 2}
+            if duplicate_groups:
+                st.write("統合対象：" + "、".join([f"{k}（{len(v)}ID）" for k, v in duplicate_groups.items()]))
+                if st.button("同名IDを一括統合する", key="admin_merge_duplicate_nicknames", type="primary", use_container_width=True):
+                    merged_total = 0
+                    errors = []
+                    for _nick in list(duplicate_groups.keys()):
+                        try:
+                            _, count, _ = merge_participants_by_nickname(_nick)
+                            merged_total += count
+                        except Exception as e:
+                            errors.append(f"{_nick}: {e}")
+                    if errors:
+                        st.warning("一部の統合でエラーが発生しました：" + " / ".join(errors))
+                    else:
+                        st.success(f"統合しました。旧ID {merged_total}件を代表IDへ集約しました。")
+                    st.rerun()
+            else:
+                st.success("現在、未統合の同名・複数IDはありません。")
+
         rows, error = load_all_quest_progress_rows()
         if error:
             st.error(f"Supabaseからデータを取得できませんでした：{error}")
             return
+
+        rows, merged_source_ids = filter_merged_source_rows(rows)
 
         profile_df = build_admin_profile_df(rows)
         feedback_df = build_admin_feedback_df(rows)
@@ -2323,6 +2864,8 @@ def render_admin_mode():
         c2.metric("終了後アンケート", len(feedback_df) if not feedback_df.empty else 0)
         c3.metric("全体アンケート", len(survey_df[survey_df["レコード"] == "現在回答"]) if not survey_df.empty else 0)
         c4.metric("クエスト記録", len(quest_df) if not quest_df.empty else 0)
+        if merged_source_ids:
+            st.caption(f"同名統合済みの旧ID：{len(merged_source_ids)}件（集計から除外・元データはSupabaseに保持）")
 
         t1, t2, t3, t4 = st.tabs([
             "👤 初回年代・参加者",
@@ -2438,7 +2981,14 @@ try:
     if isinstance(pid_q, list):
         pid_q = pid_q[0] if pid_q else ""
     if pid_q and not st.session_state.participant_id:
-        st.session_state.participant_id = str(pid_q).strip()
+        requested_pid = str(pid_q).strip()
+        resolved_pid = _resolve_merged_pid(requested_pid) if supabase_configured() else requested_pid
+        st.session_state.participant_id = resolved_pid or requested_pid
+        if resolved_pid and resolved_pid != requested_pid:
+            try:
+                st.query_params["pid"] = resolved_pid
+            except Exception:
+                pass
 except Exception:
     pass
 
@@ -2508,6 +3058,33 @@ if (
         if missing:
             st.error("入力してください：" + "、".join(missing))
         else:
+            # まず同じニックネームの既存参加者を検索。
+            # 見つかれば新しいIDを作らず、その人の進捗を引き継ぐ。
+            existing_loaded = False
+            if supabase_configured():
+                try:
+                    existing_loaded = switch_to_existing_participant(first_name)
+                except Exception:
+                    existing_loaded = False
+
+            if existing_loaded:
+                # 既存ユーザーの保存済み年代を優先。
+                # 古いデータで年代が無い場合のみ今回選択値を補う。
+                if not str(st.session_state.get("profile_age", "")).strip():
+                    st.session_state.profile_age = first_age
+                    try:
+                        save_profile_to_supabase()
+                    except Exception:
+                        pass
+                    save_user_data()
+
+                st.success(
+                    f"{first_name} さんの前回データを読み込みました。"
+                    "クエストの続きから再開できます。"
+                )
+                st.rerun()
+
+            # 同名が見つからない場合のみ、新しい参加者として登録
             if not str(st.session_state.get("participant_id", "")).strip():
                 st.session_state.participant_id = (
                     "AMK-" + uuid.uuid4().hex[:10].upper()
